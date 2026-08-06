@@ -136,7 +136,7 @@ journal_offset:     u64
 checksum_table_offset: u64
 bad_block_map_offset:  u64
 reservation_table_offset: u64
-superblock_checksum: sha256
+superblock_checksum: u64  — xxhash3_64 of the superblock
 ```
 
 The `active_transaction_count` is the primary crash detection mechanism. If it is greater than 0 on mount, crash recovery is triggered automatically for all pending transaction manifests.
@@ -155,7 +155,7 @@ permissions:        u32
 owner:              u32
 flags:              u32                — bits: 0x1 = INODE_PENDING_COMMIT
 fallback_path_offset: u64 | null        — offset to source path on META device (Live-Migration Symlink Fallback)
-checksum:           sha256  — checksum of this inode structure
+checksum:           u64  — xxhash3_64 of this inode structure
 ```
 
 *Note on Inode Table Capacity:* The inode table on the metadata SSD is dynamically growable. Unlike ext2/ext3's fixed-size tables formatted at creation time, DNPFS allocates metadata blocks in chained blocks of 512 inodes each as the number of files grows, eliminating the classic "out of inodes" constraint entirely.
@@ -218,7 +218,7 @@ DNPFS uses a two-level checksum architecture that balances precision with perfor
 
 ### Level 1 — Individual Block Checksums
 
-Every data block has a compact 64-bit xxHash3 (or CRC32C) checksum stored in the checksum table on the metadata device. This provides a low-overhead, precise, per-block verification footprint (20 bytes per block entry, equivalent to ~0.48% of the data drive capacity), making it small enough to fit within SSD metadata devices. Cryptographic SHA-256 is reserved strictly for complete file-level verification and offline forensic checks, not for per-block storage.
+Every data block has a compact 64-bit xxHash3 (or CRC32C) checksum stored in the checksum table on the metadata device. This provides a low-overhead, precise, per-block verification footprint (20 bytes per block entry, equivalent to ~0.48% of the data drive capacity), making it small enough to fit within SSD metadata devices. xxHash3 is used for both individual block validation and complete file-level verification, keeping the entire pipeline non-cryptographic and highly performant.
 
 ```
 Block 400000 → xxhash3: 0xA3F9B2C10D2E4A9F
@@ -233,8 +233,8 @@ Individual checksums are consulted during writes (read-back verification), durin
 Blocks are organized into groups of N (default: 100, configurable). A single group checksum covers the combined state of all blocks in the group.
 
 ```
-Group 0 (blocks 0–99):   sha256 of [checksum0 + checksum1 + ... + checksum99]
-Group 1 (blocks 100–199): sha256 of [checksum100 + ... + checksum199]
+Group 0 (blocks 0–99):   xxhash3_64 of [checksum0 + checksum1 + ... + checksum99]
+Group 1 (blocks 100–199): xxhash3_64 of [checksum100 + ... + checksum199]
 ```
 
 **Routine health check flow (Data Verification / Scrubbing):**
@@ -278,7 +278,7 @@ To achieve high write-performance, DNPFS implements **Deferred Checksumming** du
 
 ### Why This Matters for Small Files
 
-Per-block checksums have disproportionate overhead for small files. A 32-byte SHA-256 checksum on a 100-byte file is 32% overhead just for the checksum entry, not counting inode and directory cost. Group checksums amortize this — the group check covers multiple files in one operation. Individual checksums for small files still exist but are only read when the group check fails.
+Per-block checksums have disproportionate overhead for small files. An 8-byte xxhash3_64 checksum on a 100-byte file is 8% overhead just for the checksum entry, not counting inode and directory cost. Group checksums amortize this — the group check covers multiple files in one operation. Individual checksums for small files still exist but are only read when the group check fails.
 
 For very small files (below a configurable threshold, suggested: 4KB), a future optimization may store the file content inline on the meta device entirely, eliminating the data device round-trip and the need for a block-level checksum for those files.
 
@@ -288,7 +288,7 @@ For very small files (below a configurable threshold, suggested: 4KB), a future 
 group_id:           u64
 block_range_start:  u64
 block_range_end:    u64
-group_checksum:     sha256
+group_checksum:     u64  — xxhash3_64 of member block hashes
 last_verified:      timestamp
 member_count:       u32
 ```
@@ -312,7 +312,7 @@ reservation_id: uuid
 source:
   path: /original/file/path
   size_bytes: 1073741824
-  checksum_sha256: a3f9b2c1...
+  checksum_xxhash3: 0xa3f9b2c1...
   cascade_delete_on_confirm: true  # if true, acts as a move/migration (deletes source after verify)
   expected_mtime: 1783492800        # used for source mutation verification
   expected_inode: 289410            # used for source mutation verification
@@ -441,7 +441,7 @@ To achieve VFS compliance and prevent data corruption, DNPFS does not support in
 
 To eliminate data loss risks from partial or interrupted moves, direct metadata-only "move" operations across devices are banned. Move operations are implemented explicitly as a three-phase transaction:
 1. **Copy Phase:** All target data blocks are sequentially copied to the DNPFS device using standard write reservations.
-2. **Verification Phase:** The driver performs cryptographic block checksum comparisons (xxHash3/CRC32C) and file-level verification (SHA-256) between the source and destination.
+2. **Verification Phase:** The driver performs block checksum comparisons (xxHash3/CRC32C) and file-level verification (xxHash3) between the source and destination.
 3. **Delete Phase:** Only after verification successfully confirms data identity, the driver issues a secure delete operation to the original source file.
 
 > [!IMPORTANT]
@@ -621,7 +621,7 @@ Before every transaction, the current state of affected inodes and directory ent
 
 ### Per-Block Checksums
 
-Every data block written to the data device has a corresponding SHA-256 checksum stored in the checksum table on the meta device. This enables detection of silent write failures — cases where the drive confirms a write but writes garbage.
+Every data block written to the data device has a corresponding xxHash3/CRC32C checksum stored in the checksum table on the meta device. This enables detection of silent write failures — cases where the drive confirms a write but writes garbage.
 
 **On write:** checksum is computed before write, stored in manifest, verified by read-back after write, then stored permanently in the checksum table.
 

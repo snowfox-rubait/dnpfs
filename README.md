@@ -31,7 +31,7 @@ DNPFS eliminates that entirely.
 
 **Transactional isolation via Inode flags.** Files being written/copied are immediately visible in the directory structure but carry the `INODE_PENDING_COMMIT` flag. Any concurrent read requests to these files are either transparently redirected (using the Live-Migration Symlink Fallback) or blocked, preventing processes from reading stale/unwritten disk blocks.
 
-**Two-level deferred checksumming.** At copy/write time, blocks are grouped (dynamic sizing based on file size) to write a single group checksum, minimizing write latency and SSD wear. Individual file/block SHA-256 checksums are generated in the background when the drive is idle. Routine integrity checks verify group checksums first, dropping to individual checksums only to pinpoint corruption.
+**Two-level deferred checksumming.** At copy/write time, blocks are grouped (dynamic sizing based on file size) to write a single group checksum, minimizing write latency and SSD wear. Individual file/block xxHash3 checksums are generated in the background when the drive is idle. Routine integrity checks verify group checksums first, dropping to individual checksums only to pinpoint corruption.
 
 **Accidental format protection.** When mounted, DNPFS opens the data device exclusively (`O_EXCL`), causing formatting and partitioning utilities (`mkfs`, `fdisk`) to fail with a write-protect/busy error. This is coupled with a minimal Data Signature Header on Sector 0 (and backed up on the last sector) so standard tools identify it as DNPFS.
 
