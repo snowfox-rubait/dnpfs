@@ -213,7 +213,7 @@ checksum:           u64                — 8 bytes (xxhash3_64 of inode structur
 
 * **Symlinks (V1 Native Support & Long-Path Spillover):** 
   - **Fast Inline Symlinks ($\le 128$ bytes):** Symlink targets up to 128 bytes are stored inline within the inode payload (`symlink_target: [u8; 128]`), providing $O(1)$ zero-allocation lookups directly from memory.
-  - **Long Symlinks ($129$ to $4096$ bytes `PATH_MAX` & Full Checksum Coverage):** If a symlink target path exceeds 128 bytes (up to Linux `PATH_MAX` of 4096 bytes), `mode_flags` marks the inode as `INODE_TYPE_LONG_SYMLINK`. The inode allocates a standard 4 KB data block on the **DATA Device** via `payload.file_data.extents` to store the target path. Because the block resides on the DATA device, `dnpfs_extent.start_block` remains 100% consistent, and the long symlink content is **fully covered by Level 1 and Level 2 xxHash3 checksums** in the checksum table on the metadata SSD.
+  - **Long Symlinks ($129$ to $4096$ bytes `PATH_MAX`, Full Transaction Pipeline & Checksum Coverage):** If a symlink target path exceeds 128 bytes (up to Linux `PATH_MAX` of 4096 bytes), `mode_flags` marks the inode as `INODE_TYPE_LONG_SYMLINK`. Long symlink creation allocates a 4 KB data block on the **DATA Device** and executes the **full 6-phase transaction pipeline** (generating an `allocation_<write_id>.dry` manifest, reserving the block, writing with FUA, performing Phase 4 xxHash3 read-back verification, and committing the inode). If power fails mid-creation, boot-time recovery safely rolls back uncommitted metadata and reclaims the block, completely eliminating dangling allocations. *(Tradeoff Note: Resolving a long symlink requires a 1-block read from the DATA device, whereas inline symlinks $\le 128$ bytes resolve in-memory $O(1)$ from the metadata SSD).*
 * **Hardlinks (V1 Native Support):** Multiple directory entries may reference the same `inode_id`. The inode tracks references via `link_count: u32`. When a file is unlinked, `link_count` decrements; data blocks and metadata are freed only when `link_count` reaches 0. Fully supported in V1 for `rsync --link-dest` backup rotation.
 * **Extended Attributes (xattrs) & POSIX ACLs (Planned for V2):** xattr blocks and POSIX ACL permission structures are deferred to V2. V1 returns `ENOTSUP` for xattr/ACL syscalls (`getxattr`, `setxattr`).
 * **Explicit `mmap()` Compliance Policy:**
@@ -602,13 +602,13 @@ If data device goes offline mid-write:
   → Release reservations
 ```
 
-*Kernel-to-Userspace Netlink IPC Bridge & IOCTL Authorization (`CAP_SYS_ADMIN`):*
-Because kernel space (`dnpfs.ko`) cannot directly render interactive desktop or CLI dialogs, offline device recovery events are communicated via Linux Generic Netlink (`NETLINK_GENERIC`) sockets with sequence acknowledgments:
-1. When `dnpfs.ko` detects a device offline event mid-write, it sends a reliable Netlink event (`DNPFS_NL_EVT_OFFLINE`, with sequence ACKs to prevent packet drops under socket pressure) containing the volume UUID and pending transaction ID.
-2. The background userspace daemon `dnpfsd` (which runs as a system service) listens on the Generic Netlink socket.
-3. If an active desktop or terminal session is present, `dnpfsd` spawns a desktop notification or CLI prompt (`dnpfs-dry --prompt`).
-4. **Strict IOCTL Authorization:** When the operator selects a decision (A/B/C), `dnpfsd` passes the choice back to `dnpfs.ko` via `DNPFS_IOC_RESOLVE_OFFLINE_EVENT`. The kernel driver strictly enforces `capable(CAP_SYS_ADMIN)`; any unprivileged local process calling this IOCTL is rejected immediately with `EPERM`.
-5. If Netlink delivery fails or no response occurs within 30 seconds (or on headless servers without `dnpfsd`), `dnpfs.ko` automatically executes **Option C (Halt and Preserve Current State)**.
+*Kernel-to-Userspace Netlink IPC Bridge & Authorization Protocol (`CAP_SYS_ADMIN` + File Descriptor Ownership):*
+Because kernel space (`dnpfs.ko`) cannot directly render interactive desktop or CLI dialogs, offline device recovery events are communicated via Linux Generic Netlink (`NETLINK_GENERIC`) sockets:
+1. **Netlink Reliable Delivery Protocol:** When `dnpfs.ko` detects a device offline event mid-write, it transmits a Generic Netlink event (`DNPFS_NL_EVT_OFFLINE`, carrying a 32-bit sequence number `seq_num`, volume UUID, and transaction ID) and waits for a userspace ACK (`DNPFS_NL_ACK`). The driver retries up to 3 times at 1-second intervals. If 3 retries expire without an ACK (e.g. `dnpfsd` is not running or crashed), `dnpfs.ko` falls back to **Option C (Halt and Preserve)**.
+2. **Daemon Restart Resilience:** If `dnpfsd` crashes and restarts while an offline recovery event is active, `dnpfsd` queries active pending events via `DNPFS_IOC_GET_PENDING_EVENTS` on startup to resume the pending operator prompt seamlessly.
+3. **Userspace Prompting:** The background daemon `dnpfsd` listens on the Netlink socket. If an active desktop or terminal session is present, `dnpfsd` spawns a desktop notification or CLI prompt (`dnpfs-dry --prompt`).
+4. **Strict IOCTL Authorization & Per-Volume Scoping:** When the operator selects a decision (A/B/C), `dnpfsd` passes the choice back to `dnpfs.ko` via `DNPFS_IOC_RESOLVE_OFFLINE_EVENT`. The kernel driver strictly enforces `capable(CAP_SYS_ADMIN)` **AND** verifies that the calling process owns an active file descriptor pointing to the target volume's mount point, ensuring per-volume isolation.
+5. If no response occurs within 30 seconds (or on headless servers without `dnpfsd`), `dnpfs.ko` automatically executes **Option C (Halt and Preserve Current State)**.
 
 **On power loss detection (boot-time):**
 
