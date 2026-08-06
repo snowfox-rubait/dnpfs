@@ -381,12 +381,11 @@ confirmation:
 15. Optionally trigger meta backup if threshold exceeded
 ```
 
-### Expiry & Lease Renewal
+### Indefinite Kernel Reservations (No Wall-Clock Expiry)
 
-Reservations automatically expire after a configurable duration. To accommodate extremely large or slow writes (which can take hours to write sequentially to HDDs), the expiry time is calculated dynamically during the planning phase:
-$$\text{Expiry Duration} = \max\left(30\text{ minutes},\ 2 \times \text{estimated\_write\_time\_ms}\right)$$
+Unlike userspace leases, reservations in DNPFS are held strictly in RAM by the kernel's transaction coordinator. They **do not expire based on wall-clock time**. 
 
-For active, long-running writes, the writing process must periodically send a heartbeat signal to `dnpfsd` to renew the reservation lease. On boot, the driver scans the pending reservation table, invalidates expired leases, and releases their blocks back to the free block bitmap. This prevents reservation buildup from aborted writes.
+For active, long-running writes, the kernel driver simply maintains the reservation indefinitely until the physical write completes. Once the transaction explicitly commits or aborts, the driver atomically releases the reservation. The only scenario where a reservation "times out" is if the entire OS crashes; upon the next boot, the recovery loop scans the `/transactions/` directory and safely rolls back/releases any dangling reservations left by the interrupted kernel thread. This fully eliminates any risk of lease-expiry double-allocation races mid-runtime.
 
 ---
 
@@ -416,11 +415,11 @@ PHASE 3: RESERVATION
   Suppress TRIM on reserved blocks
 
 PHASE 4: EXECUTION
-  Write metadata first (inode updates, directory entries)
-  Flush meta device
-  Write data blocks to data device
+  Write data blocks to data device first
   After each block: read back and verify checksum (or dirty-page verify for RAM safety)
   On checksum mismatch: flag bad sector, find alternative, retry
+  Write metadata second (inode updates, directory entries)
+  Flush meta device
 
 PHASE 5: CONFIRMATION
   Cross-reference written blocks against allocation.dry
@@ -456,8 +455,14 @@ To eliminate data loss risks from partial or interrupted moves, direct metadata-
 > [!IMPORTANT]
 > **Contributor Invariant:** The Delete Phase **must never** execute in parallel with the Copy Phase or before Verification completes. Any attempts to "optimize" this transaction via parallel copying and deleting are strictly prohibited. This is a core architectural decision for data safety and must not be modified.
 
-### Live-Migration Symlink Fallback
+### Live-Migration Symlink Fallback (Planned for V2)
 
+> [!NOTE]
+> **V1 Implementation Constraint:** The Live-Migration Fallback feature involves complex cross-process namespace boundary crossing, kernel pointer lifecycles, and TOCTOU mitigations. To minimize kernel security risks (CVEs) and scope creep for the initial MVP, this feature is strictly deferred to V2. 
+> 
+> **For V1:** Any `read()` or `open()` attempt on a pending inode simply blocks (if `O_NONBLOCK` is unset) or returns `EBUSY` until the transaction completes.
+
+<!--
 To prevent active readers from experiencing read blocks or downtime during a slow copy/move operation, DNPFS implements a metadata-level **Live-Migration Symlink Fallback** redirection:
 * **Pending Commit Flag:** When a write/copy begins, the inode is created immediately on the metadata device with the `INODE_PENDING_COMMIT` flag set in its `flags` field.
 * **Encapsulated Redirection:** The `fallback_path_offset` field in the inode points to the file path of the original source file on the host OS. This path is stored internally in the metadata table and is **never** exposed to userspace as a literal symlink (e.g., `readlink()` and `ls -l` will report the file as a normal regular file with its eventual size). To bypass mount namespace visibility issues (such as containers), the driver opens the source file once during Phase 1 (Planning) using the initiator's namespace/credentials, obtaining an active kernel `struct file *` reference stored in RAM. The fallback read path directly invokes `kernel_read` on this file reference. To ensure kernel safety, this `struct file *` reference is owned and managed strictly by the global driver superblock context in RAM, not the initiating process. If the initiating process terminates, the file reference is kept alive by the global driver coordinator and is only released (`fput`) when the copy transaction either commits or aborts.
@@ -482,6 +487,7 @@ To prevent active readers from experiencing read blocks or downtime during a slo
     5. **Reader Wakeup:** Wakes any readers sleeping on the transaction's commit wait-queue, immediately returning `ENOENT`.
     6. **POSIX-compliant In-Flight Reads:** If a reader is actively streaming via Live-Migration fallback when `unlink()` occurs, the driver keeps the internal source file descriptor open and continues serving reads from the original source file until the user closes the local file handle.
 * **Atomic Promotion:** Once the copy completes and passes checksum validation, the driver atomically clears the `INODE_PENDING_COMMIT` flag and the `fallback_path_offset` field, promoting the file to a standard local DNPFS inode. If a move was requested, the source file deletion is then safely triggered.
+-->
 
 ---
 
