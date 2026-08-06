@@ -428,11 +428,18 @@ To eliminate data loss risks from partial or interrupted moves, direct metadata-
 2. **Verification Phase:** The driver performs cryptographic block checksum comparisons (xxHash3/CRC32C) and file-level verification (SHA-256) between the source and destination.
 3. **Delete Phase:** Only after verification successfully confirms data identity, the driver issues a secure delete operation to the original source file.
 
+> [!IMPORTANT]
+> **Contributor Invariant:** The Delete Phase **must never** execute in parallel with the Copy Phase or before Verification completes. Any attempts to "optimize" this transaction via parallel copying and deleting are strictly prohibited. This is a core architectural decision for data safety and must not be modified.
+
 ### Live-Migration Symlink Fallback
 
 To prevent active readers from experiencing read blocks or downtime during a slow copy/move operation, DNPFS implements a metadata-level **Live-Migration Symlink Fallback** redirection:
 * **Pending Commit Flag:** When a write/copy begins, the inode is created immediately on the metadata device with the `INODE_PENDING_COMMIT` flag set in its `flags` field.
-* **Source Redirection:** The `fallback_path_offset` field in the inode points to the file path of the original source file on the host OS.
+* **Encapsulated Redirection:** The `fallback_path_offset` field in the inode points to the file path of the original source file on the host OS. This path is stored internally in the metadata table and is **never** exposed to userspace as a literal symlink (e.g., `readlink()` and `ls -l` will report the file as a normal regular file with its eventual size).
+* **Source Mutation Protection:** During Phase 1 (Planning), the driver records the source file's `mtime`, `size`, and `inode_id` in the `allocation_<write_id>.dry` manifest. Every intercepted read request validates that the source file's current attributes match these records. If a mismatch is detected:
+  * The read fails with `ESTALE` (Stale file handle) or `EIO`.
+  * The copy transaction is aborted and rolled back.
+* **Crash Recovery Persistence:** If a system crash occurs mid-copy, the boot-time recovery manager scans for pending manifests and re-establishes the temporary in-RAM redirection tables, ensuring data availability until the transaction is either rolled back or completed.
 * **Syscall Interception:**
   * `read()` / `open(O_RDONLY)`: The VFS driver intercepts read requests to the pending inode and transparently redirects them to read from the original source file.
   * `write()` / `open(O_WRONLY)`: Any write operations requested by other processes return `EBUSY`.

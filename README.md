@@ -45,6 +45,9 @@ DNPFS eliminates that entirely.
 
 **Unified transaction model.** Writes, deletes, copies, and renames all follow the same lifecycle: plan → dry run → reserve → execute → verify → confirm. Every operation is recoverable at every stage. Direct cross-device moves are banned and replaced by a secure Copy-Verify-Delete pipeline, featuring a Live-Migration Symlink Fallback to guarantee zero-downtime read redirection during copying.
 
+> [!IMPORTANT]
+> **Contributor Invariant:** The source file deletion phase **must never** execute in parallel with the copy phase or before verification has fully succeeded. Any attempts to "optimize" this by running copy and delete operations concurrently are strictly prohibited. This is a core architectural decision for data safety and must not be changed.
+
 ---
 
 ## Architecture
