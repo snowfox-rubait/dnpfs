@@ -112,21 +112,14 @@ Both devices are identified by **UUID only** — never by `/dev/sdX` names, whic
 
 To protect against metadata corruption, the metadata device maintains **Redundant Superblocks** at fixed offsets (primary at `0x1000`, with backups at block offsets 1024, 8192, and 32768). **Bitmap Reservation Invariant:** Block offsets 0, 1024, 8192, and 32768 on `DNPFS_META` are permanently marked as allocated/reserved in the metadata block bitmap during `dnpfs-format`, excluding them from all dynamic allocation pools and preventing inadvertent overwrite by dynamic metadata expansion.
 
-### Self-Contained Offline Driver Distribution Partition (`DNPFS_BOOTSTRAP`)
+*Note on Partitioning & Exclusive Kernel Claims:* When `dnpfs.ko` mounts the volume, exclusive kernel locks (`bd_holder`) are claimed **strictly on the metadata partition (`DNPFS_META`, e.g. `/dev/nvme0n1p2`)** and data partition (`DNPFS_DATA`, e.g. `/dev/sdb1`), rather than claiming the raw whole-disk device node (`/dev/nvme0n1`). Optional deployment partitions (such as `DNPFS_BOOTSTRAP` FAT32 for zero-download driver packaging) are specified as post-MVP roadmap features in [Future Work](#future-work).
 
-To simplify offline deployment across Linux hosts that lack pre-installed DNPFS packages, `dnpfs-format` supports partitioning the metadata SSD into two logical partitions:
+### Theoretical Metadata Sizing Estimates (Subject to Empirical FUSE Validation)
 
-1. **Partition 1: `DNPFS_BOOTSTRAP` (512 MB FAT32):**
-   - A standard FAT32 partition auto-mounted by host Linux desktop environments.
-   - Houses offline Linux driver source trees (`dnpfs-dkms`), statically compiled Linux binaries (`dnpfs-fuse` AppImage for x86_64 and AArch64), setup scripts (`dnpfs-mount.sh`), and `udev` rule helpers.
-   - **Zero-Download Offline Mounting (Linux):** On Linux hosts, users can mount the DNPFS volume offline without needing an active internet connection to fetch driver packages. Execution of mount scripts requires explicit user invocation (`./dnpfs-mount.sh`), adhering to Linux security standards without relying on untrusted auto-execution.
-2. **Partition 2: `DNPFS_META` (Remaining SSD Capacity):**
-   - Houses the raw DNPFS metadata structures (Superblock, Transaction Region, Tagged-Union Inode Table, Level 1 & 2 Checksum Maps, Bad Block Maps).
-   - **Partition-Scoped Kernel Claims:** When `dnpfs.ko` mounts the volume, exclusive kernel locks (`bd_holder`) are claimed **strictly on Partition 2 (`DNPFS_META`, e.g. `/dev/nvme0n1p2`)** and the data partition (`DNPFS_DATA`, e.g. `/dev/sdb1`), rather than claiming the raw whole-disk device node (`/dev/nvme0n1`). This guarantees that Partition 1 (`DNPFS_BOOTSTRAP`) remains fully accessible and mounted by the host OS without file locking collisions. Parent disk partition tables are protected against re-partitioning via standard `udev` rules matching DNPFS partition signatures.
+> [!NOTE]
+> **Prototyping Disclaimer:** The calculations below represent theoretical structural floor estimates derived from baseline struct sizes and default 4KB block allocations. These estimates serve as initial architectural design guidelines and will be empirically benchmarked and validated against real workloads during initial FUSE driver prototyping (`dnpfs-fuse`).
 
-### Metadata Sizing Ratio Derivation (1.0% – 1.5%)
-
-The required metadata device capacity relative to data device capacity ($1.0\% \text{ to } 1.5\%$) is derived mathematically using exact block allocation calculations:
+The required metadata device capacity relative to data device capacity ($1.0\% \text{ to } 1.5\%$) is estimated using block allocation models:
 
 1. **Level-1 Checksum Table Footprint ($0.49\%$):**
    - Data Block Size: $4096 \text{ bytes}$ ($4\text{ KB}$).
@@ -138,12 +131,12 @@ The required metadata device capacity relative to data device capacity ($1.0\% \
    - Default allocation ratio (1 inode per 32KB to 64KB data):
      - At 64KB per inode: $\frac{256\text{B}}{65536\text{B}} = 0.00390625 \approx \mathbf{0.39\%}$ ($0.3906\%$).
      - At 32KB per inode: $\frac{256\text{B}}{32768\text{B}} = 0.0078125 \approx \mathbf{0.78\%}$ ($0.7813\%$).
-     - *(Note: For dense small-file workloads at 16KB per inode, $\frac{256\text{B}}{16384\text{B}} = 0.015625 \approx 1.56\%$, which increases the total metadata requirement up to $\approx 2.28\%$).*
+     - *(Note: For dense small-file workloads at 16KB per inode, $\frac{256\text{B}}{16384\text{B}} = 0.015625 \approx 1.56\%$, which increases the estimated metadata requirement up to $\approx 2.28\%$).*
 
 3. **Journal WAL, Bad Block Maps, Reservation Tables & Transaction Manifests ($0.12\%$ to $0.23\%$):**
    - Fixed ring buffers, bad sector tracking maps, transaction manifests, and pre-operation snapshots consume $\approx \mathbf{0.12\% \text{ to } 0.23\%}$.
 
-$$\text{Total Metadata Ratio (Standard Workload)} = 0.4883\% + (0.3906\% \text{ to } 0.7813\%) + (0.1211\% \text{ to } 0.2304\%) = \mathbf{1.00\% \text{ to } 1.50\%}$$
+$$\text{Estimated Total Metadata Ratio (Standard Workload)} = 0.4883\% + (0.3906\% \text{ to } 0.7813\%) + (0.1211\% \text{ to } 0.2304\%) = \mathbf{1.00\% \text{ to } 1.50\%}$$
 
 ---
 
@@ -505,7 +498,7 @@ PHASE 3: RESERVATION
 PHASE 4: EXECUTION
   Write data blocks to data device sequentially
   Verify in-RAM dirty-page checksum right before disk controller submission (prevents RAM corruption)
-  Optional (verify=full_readback): Read back written block from disk and verify checksum (disabled by default on HDDs to preserve 150+ MB/s sequential performance)
+  Optional (verify=full_readback): Read back written block from disk and verify checksum (disabled by default on HDDs; Design Target: preserve >= 90% of native sequential disk write bandwidth by delegating disk verification to background scrubbing)
   On checksum mismatch: flag bad sector, allocate alternative block, retry write
   Write metadata second (inode updates, directory entries) to metadata SSD WAL
   Flush meta device (FUA)
@@ -1102,7 +1095,7 @@ These are fundamental constraints that cannot be engineered away, only mitigated
 
 Two physically separate devices cannot achieve native hardware-level atomic synchronization during a crash. There exists a microsecond gap between the metadata device confirmation and the data device write where power loss can occur, introducing a structural **split-brain risk** where the metadata device and data device disagree on state.
 
-DNPFS resolves this by defining strict write-ordering boundaries using WAL transactions. If power is lost during this time-gap, recovery is fully deterministic: the boot-time recovery manager scans `/transactions/` for active manifests and replays or rolls back the metadata to match the physical blocks actually written on the data drive, eliminating split-brain desynchronization.
+DNPFS resolves this by defining strict write-ordering boundaries using WAL transactions. If power is lost during this time-gap, recovery is fully deterministic: the boot-time recovery manager scans `/transactions/` for active manifests and replays or rolls back the metadata to match the physical blocks actually written on the data drive, bounding and deterministically recovering from split-brain desynchronization.
 
 ### Drive Firmware Lies
 
@@ -1112,6 +1105,7 @@ Even with FUA, some drive firmware reports confirmation before physical write is
 
 ## Future Work
 
+- **Self-Contained Plug-and-Play Bootstrap Partition (`DNPFS_BOOTSTRAP`)** — optional 512 MB FAT32 metadata partition embedding offline Linux DKMS drivers, statically compiled `dnpfs-fuse` AppImage binaries (x86_64/AArch64), and setup scripts to enable zero-download mounting across arbitrary hosts.
 - **Git-based metadata backup** — serialize metadata state as structured text (YAML/CBOR) and commit to a self-hosted git repository (Gitea/Forgejo) on every backup trigger. Provides full version history, delta compression, diff visibility between states, and push to any remote. Planned as a separate subsystem with native support in `dnpfsd`.
 - **Inline small file storage** — files below a configurable size threshold (suggested: 4KB) stored entirely on the meta device, eliminating the data device round-trip and block-level checksum overhead for small files
 - **Parity blocks for meta device** — store XOR parity of metadata regions to enable single-sector reconstruction without a full backup restore
