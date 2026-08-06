@@ -454,7 +454,8 @@ To prevent active readers from experiencing read blocks or downtime during a slo
   * **Pending without Fallback Source (New File Writes):**
     * `read()` / `open(O_RDONLY)`: In blocking mode (default), the read call blocks (putting the thread to sleep in a commit wait-queue) until the transaction completes and the flag is cleared. In non-blocking mode (`O_NONBLOCK`), the call returns `EAGAIN` or `EBUSY` immediately.
     * `write()` / `open(O_WRONLY)`: The initial write worker executes the write; concurrent write requests from other processes return `EBUSY`.
-  * `rename()` / `unlink()`: Directory modifications on any pending inodes return `EBUSY`.
+  * `rename()`: **Allowed.** Modifying directory names updates only the SSD directory pointer to the inode's fixed `inode_id`. Write transactions are tracked by `inode_id`, keeping block copies completely unaffected by path renames.
+  * `unlink()`: **Allowed.** Removes the directory entry pointing to the `inode_id`, aborts the copy transaction immediately, and releases all reserved data blocks.
 * **Atomic Promotion:** Once the copy completes and passes checksum validation, the driver atomically clears the `INODE_PENDING_COMMIT` flag and the `fallback_path_offset` field, promoting the file to a standard local DNPFS inode. If a move was requested, the source file deletion is then safely triggered.
 
 ---
