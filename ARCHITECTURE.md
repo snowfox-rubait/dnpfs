@@ -385,7 +385,7 @@ confirmation:
 10. On full success: update manifest status to confirmed
 11. Update inode table and directory entries
 12. Update checksum table
-13. Mark dirty_flag clean
+13. Delete manifest from /transactions/ directory
 14. Release reservations
 15. Optionally trigger meta backup if threshold exceeded
 ```
