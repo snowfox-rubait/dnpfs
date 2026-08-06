@@ -55,7 +55,7 @@ DNPFS is **not** designed for OS installation. It is a storage filesystem for la
 
 **Metadata is more valuable than data.** The 2TB data drive dying is survivable with backups. The 16GB metadata drive dying without a backup means the 2TB becomes a pile of unaddressed blocks. The system treats the metadata drive accordingly — multiple redundant backups, checksummed, version-tracked.
 
-**Dry before wet.** No write operation touches either device until a full simulation has been committed, verified, and reserved. The dry run manifest is the source of truth for recovery.
+**Dry before wet.** No write operation touches either device until a simulation manifest (`allocation.dry`) has been committed, verified, and reserved in the WAL log. For known-size operations (e.g. file copies), simulation occurs upfront over the full file length; for unbounded streaming writes (`Dynamic Extent Chunking`), dry-run reservations and checksum commitments execute incrementally per 4MB chunk span. The committed manifest is the authoritative source of truth for crash recovery.
 
 **Explicit over implicit.** Write ordering, flush guarantees, TRIM suppression, and cache coordination are all explicit driver responsibilities — never assumed from the underlying hardware.
 
@@ -315,10 +315,13 @@ Level 2 group checksums use a fixed **positional formula** over 100-block spans 
 $$\text{Group\_Checksum} = \text{xxHash3\_64}([\text{checksum}_0, \text{checksum}_1, \dots, \text{checksum}_{99}])$$
 Freed block slots contribute `0x0` as a deterministic 64-bit value in the positional array. This guarantees that group hashes remain 100% deterministic after block deletions, preventing false-positive scrubbing alarms without requiring dynamic array resizing.
 
-**Level 2 Group Parity (Optional 1-Block Bit Rot Self-Healing):**
+**Level 2 Group Parity (Optional 1-Block Bit Rot Self-Healing & Failure Domain Bounds):**
 To eliminate unrecoverable data loss from single-sector bit rot without requiring full drive mirroring, DNPFS supports an optional **Level 2 Group Parity Block** stored on the metadata SSD. For every 100-block group, `dnpfs.ko` maintains a 4 KB XOR parity block calculated across all active member data blocks:
 $$\text{Parity\_Block} = B_0 \oplus B_1 \oplus \dots \oplus B_{99}$$
 When background scrubbing or a file read detects a checksum mismatch on a single block $B_k$ (where Level 1 checksum verification pinpoints the corrupted block), `dnpfs.ko` reconstructs $B_k$ in RAM using the group parity block and remaining healthy blocks ($B_k = \text{Parity} \oplus \sum_{i \neq k} B_i$). The reconstructed block is written to a clean data sector, bad sector maps are updated, and the read succeeds transparently without returning `EIO`.
+
+> [!IMPORTANT]
+> **Failure Domain Boundaries:** Level 2 Group Parity protects strictly against **isolated single-sector bit rot and transient read errors**. Because member blocks in a 100-block group are physically contiguous on disk, physically correlated damage (such as head-strike scratches, thermal damage, or multi-sector platter failure) affecting $\ge 2$ blocks within the same group will defeat single XOR parity. Correlated physical damage recovery requires block-level RAID 1/6 mirroring underneath or V2 Dispersed Interleaved Parity.
 
 **Routine health check flow (Data Verification / Scrubbing):**
 
