@@ -114,21 +114,24 @@ To protect against metadata corruption, the metadata device maintains **Redundan
 
 ### Metadata Sizing Ratio Derivation (1.0% – 1.5%)
 
-The required metadata device capacity relative to data device capacity ($1.0\% \text{ to } 1.5\%$) is derived mathematically from the on-disk footprint of DNPFS core structures:
+The required metadata device capacity relative to data device capacity ($1.0\% \text{ to } 1.5\%$) is derived mathematically using exact block allocation calculations:
 
-1. **Level-1 Checksum Table Footprint ($0.488\%$):**
+1. **Level-1 Checksum Table Footprint ($0.49\%$):**
    - Data Block Size: $4096 \text{ bytes}$ ($4\text{ KB}$).
    - Per-block checksum entry: $20 \text{ bytes}$ ($8\text{B xxHash3} + 8\text{B block flags} + 4\text{B allocation metadata}$).
-   - Ratio: $\frac{20\text{ bytes}}{4096\text{ bytes}} \approx \mathbf{0.488\%}$ of total data capacity.
+   - Ratio: $\frac{20\text{ bytes}}{4096\text{ bytes}} = 0.0048828125 \approx \mathbf{0.49\%}$ ($0.4883\%$).
 
 2. **Inode Table & Extent Indirection Footprint ($0.39\%$ to $0.78\%$):**
    - Struct inode size: $256 \text{ bytes}$.
-   - Default allocation ratio (1 inode per 32KB to 64KB data): $\approx \mathbf{0.39\% \text{ to } 0.78\%}$ ($\frac{256\text{B}}{65536\text{B}} = 0.39\%$, $\frac{256\text{B}}{32768\text{B}} = 0.78\%$).
+   - Default allocation ratio (1 inode per 32KB to 64KB data):
+     - At 64KB per inode: $\frac{256\text{B}}{65536\text{B}} = 0.00390625 \approx \mathbf{0.39\%}$ ($0.3906\%$).
+     - At 32KB per inode: $\frac{256\text{B}}{32768\text{B}} = 0.0078125 \approx \mathbf{0.78\%}$ ($0.7813\%$).
+     - *(Note: For dense small-file workloads at 16KB per inode, $\frac{256\text{B}}{16384\text{B}} = 0.015625 \approx 1.56\%$, which increases the total metadata requirement up to $\approx 2.28\%$).*
 
 3. **Journal WAL, Bad Block Maps, Reservation Tables & Transaction Manifests ($0.12\%$ to $0.23\%$):**
-   - Ring buffers, bad sector tracking maps, transaction manifests, and pre-operation snapshots consume $\approx \mathbf{0.12\% \text{ to } 0.23\%}$.
+   - Fixed ring buffers, bad sector tracking maps, transaction manifests, and pre-operation snapshots consume $\approx \mathbf{0.12\% \text{ to } 0.23\%}$.
 
-$$\text{Total Metadata Ratio} = 0.488\% + (0.39\% \text{ to } 0.78\%) + (0.12\% \text{ to } 0.23\%) = \mathbf{1.0\% \text{ to } 1.5\%}$$
+$$\text{Total Metadata Ratio (Standard Workload)} = 0.4883\% + (0.3906\% \text{ to } 0.7813\%) + (0.1211\% \text{ to } 0.2304\%) = \mathbf{1.00\% \text{ to } 1.50\%}$$
 
 ---
 
@@ -238,7 +241,7 @@ DNPFS uses a two-level checksum architecture that balances precision with perfor
 
 ### Level 1 — Individual Block Checksums
 
-Every data block has a compact 64-bit xxHash3 (or CRC32C) checksum stored in the checksum table on the metadata device. This provides a low-overhead, precise, per-block verification footprint (exactly 20 bytes per block entry, equivalent to ~0.48% of the data drive capacity), making it small enough to fit within SSD metadata devices. xxHash3 is used for both individual block validation and complete file-level verification, keeping the entire pipeline non-cryptographic and highly performant.
+Every data block has a compact 64-bit xxHash3 (or CRC32C) checksum stored in the checksum table on the metadata device. This provides a low-overhead, precise, per-block verification footprint (exactly 20 bytes per block entry, equivalent to ~0.49% / 0.4883% of the data drive capacity), making it small enough to fit within SSD metadata devices. xxHash3 is used for both individual block validation and complete file-level verification, keeping the entire pipeline non-cryptographic and highly performant.
 
 > [!NOTE]
 > **Threat Model Assumption:** DNPFS assumes a non-adversarial threat model (protecting against silent bit rot, cosmic rays, and sector/firmware errors rather than malicious cryptographic tampering). Consequently, non-cryptographic xxHash3 is used exclusively; collision resistance against malicious forgery is an accepted trade-off and is out of scope.
