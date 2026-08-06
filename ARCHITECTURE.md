@@ -211,7 +211,9 @@ checksum:           u64                — 8 bytes (xxhash3_64 of inode structur
 
 ### V1 POSIX File Type & Syscall Support (Symlinks, Hardlinks, xattrs, ACLs, mmap)
 
-* **Symlinks (V1 Native Support):** Symlink targets up to 128 bytes are stored inline within the inode payload (`symlink_target: [u8; 128]`), avoiding extra metadata block allocations. Symlink lookups are $O(1)$ directly from the inode. Fully supported in V1 for Plex/Jellyfin media libraries and dotfile management.
+* **Symlinks (V1 Native Support & Long-Path Spillover):** 
+  - **Fast Inline Symlinks ($\le 128$ bytes):** Symlink targets up to 128 bytes are stored inline within the inode payload (`symlink_target: [u8; 128]`), providing $O(1)$ zero-allocation lookups directly from memory.
+  - **Long Symlinks ($129$ to $4096$ bytes `PATH_MAX`):** If a symlink target exceeds 128 bytes (up to the full Linux `PATH_MAX` of 4096 bytes), `mode_flags` marks the inode as `INODE_TYPE_LONG_SYMLINK`, and the inode allocates a single 4 KB metadata block on the metadata SSD via `payload.file_data.extents` to store the full path target. This provides 100% POSIX `PATH_MAX` compliance while preserving the 256-byte inode struct size.
 * **Hardlinks (V1 Native Support):** Multiple directory entries may reference the same `inode_id`. The inode tracks references via `link_count: u32`. When a file is unlinked, `link_count` decrements; data blocks and metadata are freed only when `link_count` reaches 0. Fully supported in V1 for `rsync --link-dest` backup rotation.
 * **Extended Attributes (xattrs) & POSIX ACLs (Planned for V2):** xattr blocks and POSIX ACL permission structures are deferred to V2. V1 returns `ENOTSUP` for xattr/ACL syscalls (`getxattr`, `setxattr`).
 * **Explicit `mmap()` Compliance Policy:**
@@ -600,7 +602,13 @@ If data device goes offline mid-write:
   → Release reservations
 ```
 
-*Note on Headless / Unattended Operations:* In headless environments (NAS, automated servers, no interactive TTY), if no response is received within a configurable timeout (default: 30 seconds), `dnpfs.ko` automatically executes **Option C (Halt and Preserve Current State)**: data I/O is safely halted, the transaction is suspended, and a critical error is logged to `syslog`/`dmesg`.
+*Kernel-to-Userspace Netlink/uevent IPC Bridge for Offline Recovery Prompts:*
+Because kernel space (`dnpfs.ko`) cannot directly render interactive desktop or CLI dialogs, offline device events are communicated via Linux Netlink / uevent sockets:
+1. When `dnpfs.ko` detects a device offline event, it emits a kernel uevent (`DNPFS_EVENT_DEVICE_OFFLINE`) containing the volume UUID and pending transaction ID.
+2. The background userspace daemon `dnpfsd` (which runs as a system service) listens to this Netlink socket.
+3. If an active desktop or terminal session is present, `dnpfsd` spawns a desktop notification or CLI prompt (`dnpfs-dry --prompt`).
+4. If a user choice (A/B/C) is selected within 30 seconds, `dnpfsd` sends the decision back to `dnpfs.ko` via an IOCTL (`DNPFS_IOC_RESOLVE_OFFLINE_EVENT`).
+5. If no response occurs within 30 seconds (or on headless servers without `dnpfsd`), `dnpfs.ko` automatically executes **Option C (Halt and Preserve Current State)**.
 
 **On power loss detection (boot-time):**
 
