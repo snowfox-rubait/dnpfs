@@ -94,7 +94,7 @@ If you see a problem with the architecture, that is the most valuable thing you 
 ## Planned Components
 
 - `dnpfs.ko` — Linux kernel module implementing the VFS interface
-- `dnpfsd` — userspace daemon for S.M.A.R.T. polling, backup scheduling, reservation expiry
+- `dnpfsd` — userspace daemon for S.M.A.R.T. polling, backup scheduling, and orphan transaction monitoring
 - `dnpfs-format` — formats a paired meta + data volume
 - `dnpfs-check` — two-device filesystem check tool
 - `dnpfs-recover` — forensic recovery using `allocation.dry` manifests
