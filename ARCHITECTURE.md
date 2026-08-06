@@ -201,7 +201,7 @@ permissions:        u32                — 4 bytes
 owner:              u32                — 4 bytes
 flags:              u32                — 4 bytes (bits: 0x1 = INODE_PENDING_COMMIT)
 fallback_path_offset: u64              — 8 bytes (Live-Migration Symlink Fallback)
-reserved:           [u8; 56]           — 56 bytes padding to align struct to EXACTLY 256 bytes
+reserved:           [u8; 52]           — 52 bytes padding to align struct to EXACTLY 256 bytes
 checksum:           u64                — 8 bytes (xxhash3_64 of inode structure)
 ```
 
