@@ -112,16 +112,16 @@ Both devices are identified by **UUID only** — never by `/dev/sdX` names, whic
 
 To protect against metadata corruption, the metadata device maintains **Redundant Superblocks** at fixed offsets (e.g., primary at `0x1000`, with backups at block offsets 1024, 8192, and 32768).
 
-### Self-Contained Plug-and-Play Bootstrap Partition (`DNPFS_BOOTSTRAP`)
+### Self-Contained Offline Driver Distribution Partition (`DNPFS_BOOTSTRAP`)
 
-To solve the portability limitation (mounting DNPFS on computers that lack pre-installed drivers), `dnpfs-format` supports partitioning the metadata SSD into two logical partitions:
+To simplify offline deployment across Linux hosts that lack pre-installed DNPFS packages, `dnpfs-format` supports partitioning the metadata SSD into two logical partitions:
 
-1. **Partition 1: `DNPFS_BOOTSTRAP` (256 MB FAT32 / ISO9660):**
-   - A standard, universally compatible FAT32 partition mounted automatically by Linux, macOS, and Windows desktops.
-   - Houses offline driver installation packages (`dnpfs-dkms`), statically compiled userspace binaries (`dnpfs-fuse` AppImage, `dnpfs-tools`), desktop launcher scripts (`dnpfs-mount.sh`), and `udev` rule helpers.
-   - **Zero-Install Mount:** Users can plug the SSD into any host and run `./dnpfs-mount` directly from the FAT32 partition to mount the DNPFS volume instantly via bundled FUSE, without requiring an internet download or root kernel module installation.
+1. **Partition 1: `DNPFS_BOOTSTRAP` (512 MB FAT32):**
+   - A standard FAT32 partition auto-mounted by host Linux desktop environments.
+   - Houses offline Linux driver source trees (`dnpfs-dkms`), statically compiled Linux binaries (`dnpfs-fuse` AppImage for x86_64 and AArch64), setup scripts (`dnpfs-mount.sh`), and `udev` rule helpers.
+   - **Zero-Download Offline Mounting (Linux):** On Linux hosts, users can mount the DNPFS volume offline without needing an active internet connection to fetch driver packages. Execution of mount scripts requires explicit user invocation (`./dnpfs-mount.sh`), adhering to Linux security standards without relying on untrusted auto-execution.
 2. **Partition 2: `DNPFS_META` (Remaining SSD Capacity):**
-   - Houses the raw DNPFS metadata structures (Superblock, Transaction Region, Inode Table, Checksum Maps, Bad Block Maps).
+   - Houses the raw DNPFS metadata structures (Superblock, Transaction Region, Tagged-Union Inode Table, Level 1 & 2 Checksum Maps, Bad Block Maps).
 
 ### Metadata Sizing Ratio Derivation (1.0% – 1.5%)
 
@@ -213,7 +213,7 @@ checksum:           u64                — 8 bytes (xxhash3_64 of inode structur
 
 * **Symlinks (V1 Native Support & Long-Path Spillover):** 
   - **Fast Inline Symlinks ($\le 128$ bytes):** Symlink targets up to 128 bytes are stored inline within the inode payload (`symlink_target: [u8; 128]`), providing $O(1)$ zero-allocation lookups directly from memory.
-  - **Long Symlinks ($129$ to $4096$ bytes `PATH_MAX`):** If a symlink target exceeds 128 bytes (up to the full Linux `PATH_MAX` of 4096 bytes), `mode_flags` marks the inode as `INODE_TYPE_LONG_SYMLINK`, and the inode allocates a single 4 KB metadata block on the metadata SSD via `payload.file_data.extents` to store the full path target. This provides 100% POSIX `PATH_MAX` compliance while preserving the 256-byte inode struct size.
+  - **Long Symlinks ($129$ to $4096$ bytes `PATH_MAX` & Full Checksum Coverage):** If a symlink target path exceeds 128 bytes (up to Linux `PATH_MAX` of 4096 bytes), `mode_flags` marks the inode as `INODE_TYPE_LONG_SYMLINK`. The inode allocates a standard 4 KB data block on the **DATA Device** via `payload.file_data.extents` to store the target path. Because the block resides on the DATA device, `dnpfs_extent.start_block` remains 100% consistent, and the long symlink content is **fully covered by Level 1 and Level 2 xxHash3 checksums** in the checksum table on the metadata SSD.
 * **Hardlinks (V1 Native Support):** Multiple directory entries may reference the same `inode_id`. The inode tracks references via `link_count: u32`. When a file is unlinked, `link_count` decrements; data blocks and metadata are freed only when `link_count` reaches 0. Fully supported in V1 for `rsync --link-dest` backup rotation.
 * **Extended Attributes (xattrs) & POSIX ACLs (Planned for V2):** xattr blocks and POSIX ACL permission structures are deferred to V2. V1 returns `ENOTSUP` for xattr/ACL syscalls (`getxattr`, `setxattr`).
 * **Explicit `mmap()` Compliance Policy:**
@@ -602,13 +602,13 @@ If data device goes offline mid-write:
   → Release reservations
 ```
 
-*Kernel-to-Userspace Netlink/uevent IPC Bridge for Offline Recovery Prompts:*
-Because kernel space (`dnpfs.ko`) cannot directly render interactive desktop or CLI dialogs, offline device events are communicated via Linux Netlink / uevent sockets:
-1. When `dnpfs.ko` detects a device offline event, it emits a kernel uevent (`DNPFS_EVENT_DEVICE_OFFLINE`) containing the volume UUID and pending transaction ID.
-2. The background userspace daemon `dnpfsd` (which runs as a system service) listens to this Netlink socket.
+*Kernel-to-Userspace Netlink IPC Bridge & IOCTL Authorization (`CAP_SYS_ADMIN`):*
+Because kernel space (`dnpfs.ko`) cannot directly render interactive desktop or CLI dialogs, offline device recovery events are communicated via Linux Generic Netlink (`NETLINK_GENERIC`) sockets with sequence acknowledgments:
+1. When `dnpfs.ko` detects a device offline event mid-write, it sends a reliable Netlink event (`DNPFS_NL_EVT_OFFLINE`, with sequence ACKs to prevent packet drops under socket pressure) containing the volume UUID and pending transaction ID.
+2. The background userspace daemon `dnpfsd` (which runs as a system service) listens on the Generic Netlink socket.
 3. If an active desktop or terminal session is present, `dnpfsd` spawns a desktop notification or CLI prompt (`dnpfs-dry --prompt`).
-4. If a user choice (A/B/C) is selected within 30 seconds, `dnpfsd` sends the decision back to `dnpfs.ko` via an IOCTL (`DNPFS_IOC_RESOLVE_OFFLINE_EVENT`).
-5. If no response occurs within 30 seconds (or on headless servers without `dnpfsd`), `dnpfs.ko` automatically executes **Option C (Halt and Preserve Current State)**.
+4. **Strict IOCTL Authorization:** When the operator selects a decision (A/B/C), `dnpfsd` passes the choice back to `dnpfs.ko` via `DNPFS_IOC_RESOLVE_OFFLINE_EVENT`. The kernel driver strictly enforces `capable(CAP_SYS_ADMIN)`; any unprivileged local process calling this IOCTL is rejected immediately with `EPERM`.
+5. If Netlink delivery fails or no response occurs within 30 seconds (or on headless servers without `dnpfsd`), `dnpfs.ko` automatically executes **Option C (Halt and Preserve Current State)**.
 
 **On power loss detection (boot-time):**
 
