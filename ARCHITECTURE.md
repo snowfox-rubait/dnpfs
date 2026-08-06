@@ -158,6 +158,8 @@ fallback_path_offset: u64 | null        — offset to source path on META device
 checksum:           sha256  — checksum of this inode structure
 ```
 
+*Note on Inode Table Capacity:* The inode table on the metadata SSD is dynamically growable. Unlike ext2/ext3's fixed-size tables formatted at creation time, DNPFS allocates metadata blocks in chained blocks of 512 inodes each as the number of files grows, eliminating the classic "out of inodes" constraint entirely.
+
 **dnpfs_extent structure:**
 ```
 struct dnpfs_extent {
@@ -182,7 +184,7 @@ To prevent overflow in pathologically fragmented files, indirect blocks are chai
 
 ```
 data_block_offset:  u64   — sector address on DATA device
-checksum:           sha256
+checksum:           u64   — 64-bit xxHash3 or CRC32C checksum
 last_verified:      timestamp
 status:             enum { good, suspect, bad, remapped }
 ```
@@ -216,12 +218,12 @@ DNPFS uses a two-level checksum architecture that balances precision with perfor
 
 ### Level 1 — Individual Block Checksums
 
-Every data block has a SHA-256 checksum stored in the checksum table on the meta device. This is the ground truth — precise, per-block, always available for forensic use.
+Every data block has a compact 64-bit xxHash3 (or CRC32C) checksum stored in the checksum table on the metadata device. This provides a low-overhead, precise, per-block verification footprint (20 bytes per block entry, equivalent to ~0.48% of the data drive capacity), making it small enough to fit within SSD metadata devices. Cryptographic SHA-256 is reserved strictly for complete file-level verification and offline forensic checks, not for per-block storage.
 
 ```
-Block 400000 → sha256: a3f9b2...
-Block 400001 → sha256: c71d44...
-Block 400002 → sha256: 88ef01...
+Block 400000 → xxhash3: 0xA3F9B2C10D2E4A9F
+Block 400001 → xxhash3: 0xC71D44E89B01F2D3
+Block 400002 → xxhash3: 0x88EF01A9BC3D4E5F
 ```
 
 Individual checksums are consulted during writes (read-back verification), during recovery (manifest cross-check), and when a group checksum fails (see below).
@@ -449,7 +451,7 @@ To eliminate data loss risks from partial or interrupted moves, direct metadata-
 
 To prevent active readers from experiencing read blocks or downtime during a slow copy/move operation, DNPFS implements a metadata-level **Live-Migration Symlink Fallback** redirection:
 * **Pending Commit Flag:** When a write/copy begins, the inode is created immediately on the metadata device with the `INODE_PENDING_COMMIT` flag set in its `flags` field.
-* **Encapsulated Redirection:** The `fallback_path_offset` field in the inode points to the file path of the original source file on the host OS. This path is stored internally in the metadata table and is **never** exposed to userspace as a literal symlink (e.g., `readlink()` and `ls -l` will report the file as a normal regular file with its eventual size).
+* **Encapsulated Redirection:** The `fallback_path_offset` field in the inode points to the file path of the original source file on the host OS. This path is stored internally in the metadata table and is **never** exposed to userspace as a literal symlink (e.g., `readlink()` and `ls -l` will report the file as a normal regular file with its eventual size). To bypass mount namespace visibility issues (such as containers) and avoid redundant permission checks during reads, the driver opens the source file once during Phase 1 (Planning) using the initiator's namespace/credentials, obtaining an active kernel `struct file *` reference stored in RAM. The fallback read path directly invokes `kernel_read` on this file reference.
 * **Source Mutation Protection:** During Phase 1 (Planning), the driver records the source file's `mtime`, `size`, and `inode_id` in the `allocation_<write_id>.dry` manifest. Every intercepted read request validates that the source file's current attributes match these records. If a mismatch is detected:
   * The read fails with `ESTALE` (Stale file handle) or `EIO`.
   * The copy transaction is aborted and rolled back.
@@ -482,13 +484,13 @@ DNPFS consists of three components:
 Implements the VFS interface for Linux. Handles:
 
 - Mount / unmount with UUID-based device pairing verification
-- dirty_flag management
+- active_transaction_count management
 - Block allocation and inode management
 - Write ordering enforcement between meta and data devices
 - TRIM suppression for reserved and in-flight blocks
 - FUA enforcement on critical writes
 - Device health monitoring (detects offline events mid-operation)
-- **Accidental Format Protection:** Rather than dynamically toggling read-only states mid-operation (which risks race conditions), DNPFS relies on native OS-level filesystem exclusive-open locks. When DNPFS mounts the pairing, the data block device is opened with `O_EXCL` flags, preventing formatting or partitioning tools (`mkfs`, `fdisk`) from modifying the device. This is complemented by standard `udev` rules matching the DNPFS Data Signature Header to warn users of active pairing.
+- **Accidental Format Protection:** Rather than dynamically toggling read-only states mid-operation (which risks race conditions), DNPFS relies on native kernel exclusive-open claims. When DNPFS mounts the pairing, the driver acquires an exclusive lock on the data block device using the kernel's `bd_holder` claim API (via `blkdev_get_by_path` or `blkdev_get_by_dev`), causing other partitioners and formatters (`mkfs`, `fdisk`) to immediately fail with a device-busy error. This is complemented by standard `udev` rules matching the DNPFS Data Signature Header to warn users of active pairing.
 
 **On device offline detection:**
 
@@ -557,26 +559,25 @@ Drive firmware can confirm a write while data is still in the drive's internal v
 
 ### The Solution
 
-**Force Unit Access (FUA):** For all critical writes (superblock, journal, allocation.dry, dirty_flag), the driver issues writes with the FUA flag set. This instructs the drive to flush its internal cache to non-volatile storage before confirming. Drives that do not support FUA will have write caching disabled in the driver.
+**Force Unit Access (FUA):** For all critical transaction logs (WAL head pointers, superblock `active_transaction_count`, and `allocation.dry` state commits), the driver issues writes with the FUA flag set. This instructs the drive to flush its internal cache to non-volatile storage before confirming. Drives that do not support FUA will have write caching disabled in the driver.
 
-**Explicit flush ordering:** The driver enforces the following sequence for every transaction:
+**Explicit write ordering (Split-Path Design):**
+To reconcile transactional safety with wear mitigation, DNPFS separates log writes from actual structural updates:
+* **The Log Path (Synchronous WAL):** The planning manifest (`allocation.dry`) and confirmation markers are written sequentially to the Write-Ahead Log (WAL) on the metadata SSD using synchronous FUA flushes.
+* **The Structure Path (Asynchronous Checkpoints):** Structural filesystem updates (in-place inode tables, free block bitmaps, and checksum tables) are updated in RAM first. These are lazily written to the metadata device asynchronously during idle periods (checkpointing), amortizing flash wear.
 
-```
-1. Write to meta device → issue FUA flush → wait for hardware confirmation
-2. Only after meta confirms → write to data device
-3. Read back data blocks → verify checksums
-4. Write confirmation to meta device → issue FUA flush → wait for confirmation
-```
+The detailed transactional sequence is:
+1. Write the transaction planning manifest to the WAL on the metadata device → issue FUA flush → wait for hardware confirmation.
+2. Only after metadata WAL confirms → write the data blocks sequentially to the data device.
+3. Read back written data blocks from the data device → verify checksums (optional/configurable; see below).
+4. Write the confirmation marker to the metadata WAL → issue FUA flush → wait for confirmation.
+5. Inodes and block bitmaps are updated in RAM, and checkpointed to their permanent locations on the SSD asynchronously.
 
-This means the meta device always leads the data device. The data device never gets ahead of the meta device's confirmed state.
+This guarantees that the logged intent on the metadata device always leads the data device. If a crash occurs before Step 4, the metadata checkpoint is stale, but the synchronous WAL manifest allows boot recovery to replay or rollback the state perfectly.
 
-**RAM buffer:** allocation.dry in RAM provides a temporary bridge during short meta device interruptions. The RAM copy is considered authoritative only until the meta device reconnects and is verified. It is never written to the data device before meta device confirmation.
+**RAM buffer:** `allocation.dry` in RAM provides a temporary bridge during short metadata device disconnections. The RAM copy is considered authoritative only until the metadata device reconnects and is verified. It is never written to the data device before metadata WAL confirmation.
 
-**SSD Wear Mitigation & Metadata Write Coalescing:**
-To prevent premature wear on the SSD metadata device from frequent FUA flushes:
-1. **Consolidated Journaling:** Rather than flushing individual metadata sectors 4-5 times per transaction, all metadata modifications are appended sequentially to a ring-buffered Write-Ahead Log (WAL) on the metadata device. FUA is issued primarily to the WAL head pointer.
-2. **Delayed Checkpoint Flushing:** The actual inode and bitmap tables on the metadata device are updated in memory first, and written back to disk asynchronously in batches (checkpointing), amortizing physical writes.
-3. **Hardware Recommendations:** DNPFS strongly recommends the use of SSDs equipped with physical **Power Loss Protection (PLP)** capacitors (e.g., enterprise/industrial grade SSDs). On PLP-equipped SSDs, FUA commands complete near-instantly with zero physical flash cycle write penalty, as the drive controller can safely guarantee writes cached in volatile controllers.
+**Power Loss Protection (PLP) Recommendation:** DNPFS strongly recommends the use of SSDs equipped with physical **Power Loss Protection (PLP)** capacitors (e.g., enterprise/industrial grade SSDs). On PLP-equipped SSDs, FUA commands complete near-instantly with zero physical flash cycle write penalty, as the drive controller can safely guarantee writes cached in volatile controllers.
 
 ---
 
@@ -957,9 +958,18 @@ Even with FUA, some drive firmware reports confirmation before physical write is
 
 ---
 
+## Prior Art & Design Precedents
+
+DNPFS builds upon several established structural paradigms and caching drivers in the Linux filesystem space:
+* **ZFS Special VDEV Class:** ZFS allows allocating specific metadata blocks, DDT (deduplication tables), and small files to dedicated SSD devices. DNPFS takes this partition isolation further by mandating physical separation at the device driver layer.
+* **Ext4 External Journal:** Ext4 has long supported allocating its journal and transaction logs to a separate fast physical block device (`ext4 -J device=...`), separating synchronous log writes from primary metadata and data.
+* **bcache & dm-cache:** These drivers operate as block-level SSD caching layers underneath generic filesystems. DNPFS is a native filesystem rather than a block-level cache, allowing it to leverage semantic filesystem data (such as size-based extent grouping, transaction verification, and live fallbacks) that block-level caches cannot access.
+
+---
+
 ## Contributing
 
-DNPFS is open source. Contributions, design feedback, and alternative solutions to the problems described here are welcome. If you have encountered a similar architecture and have real-world failure data, please open an issue — especially for the cache coherency and FUA compliance sections.
+DNPFS is open source and dual-licensed under **GPL-2.0-only** and **MIT**. Contributions, design feedback, and alternative solutions to the problems described here are welcome. If you have encountered a similar architecture and have real-world failure data, please open an issue — especially for the cache coherency and FUA compliance sections.
 
 The design is more important than the code at this stage. If you see a flaw in the architecture, that is the most valuable thing to report.
 
