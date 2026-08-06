@@ -306,6 +306,9 @@ source:
   path: /original/file/path
   size_bytes: 1073741824
   checksum_sha256: a3f9b2c1...
+  cascade_delete_on_confirm: true  # if true, acts as a move/migration (deletes source after verify)
+  expected_mtime: 1783492800        # used for source mutation verification
+  expected_inode: 289410            # used for source mutation verification
 
 destination:
   device_uuid: <data device uuid>
