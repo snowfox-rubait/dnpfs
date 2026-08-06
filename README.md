@@ -45,7 +45,7 @@ DNPFS eliminates that entirely.
 
 **RAID compatible.** DNPFS works on top of any mdadm or dm-raid array transparently. RAID 1 on the metadata device is strongly recommended for high-availability setups and eliminates the metadata single point of failure entirely.
 
-**Copy-On-Write (COW) modifications.** To maintain strict transactional safety, random writes (`pwrite`) and truncations (`ftruncate`) use Copy-On-Write rather than in-place block updates. Edits allocate new block extents, keeping the old data intact until the write successfully verifies and commits.
+**Copy-On-Write (COW) modifications.** To maintain strict transactional safety, random writes (`pwrite`) and truncations (`ftruncate`) use Copy-On-Write rather than in-place block updates. Edits allocate new block extents, keeping the old data intact until the write successfully verifies and commits. *(Note: COW random-access writes incur metadata extent growth and checksum group write churn; DNPFS is structurally optimized for bulk sequential storage rather than random write-heavy database workloads).*
 
 **Unified transaction model.** Writes, deletes, copies, and renames all follow the same lifecycle: plan → dry run → reserve → execute → verify → confirm. Every operation is recoverable at every stage. Direct cross-device moves are banned and replaced by a secure Copy-Verify-Delete pipeline. Because writes are tracked by fixed `inode_id` mappings rather than file paths, pending copies can be renamed or deleted (aborting the transaction) on the fly without disrupting the active copy worker. Non-conflicting writes execute in parallel, and metadata commits are coalesced via **Group Commits** on the metadata SSD.
 

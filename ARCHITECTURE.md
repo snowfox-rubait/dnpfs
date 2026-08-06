@@ -79,7 +79,7 @@ For practical purposes DNPFS has no meaningful storage limit. 16 exabytes exceed
 
 FAT32 uses 32-bit fields for file size — a design decision made in the 1980s when files larger than a few MB were inconceivable. The 4GB per-file limit is a direct consequence of a 32-bit size field (2^32 bytes = 4GB). DNPFS uses 64-bit fields throughout, designed with no artificial ceiling.
 
-**Filename and path length** are not yet defined and are open for community input. Candidates are 255 bytes per component (matching ext4) and 4096 bytes for full path length. These will be finalized before the first implementation milestone.
+**Filename and path length** are explicitly fixed to standard Linux POSIX limits: **255 bytes** per filename component (`NAME_MAX`, matching ext4/btrfs) and **4096 bytes** for total path length (`PATH_MAX`). These values define the fixed buffer allocations in directory entries and inode structures for format v1.
 
 ---
 
@@ -111,6 +111,24 @@ FAT32 uses 32-bit fields for file size — a design decision made in the 1980s w
 Both devices are identified by **UUID only** — never by `/dev/sdX` names, which can change across reboots. The driver enforces pairing at mount time by verifying UUIDs stored in both device headers. To prevent the data device from appearing as completely blank/unformatted raw space to OS tools (which could lead to accidental partitioning or formatting), the data device contains a minimal 512-byte **DNPFS Data Signature Header** at Sector 0. This header stores the data device's own UUID and its paired metadata device's UUID, allowing `blkid` and `udev` to identify it. To protect against bad sectors on Sector 0, a **Backup Data Signature Header** is written to the last sector of the data device.
 
 To protect against metadata corruption, the metadata device maintains **Redundant Superblocks** at fixed offsets (e.g., primary at `0x1000`, with backups at block offsets 1024, 8192, and 32768).
+
+### Metadata Sizing Ratio Derivation (1.0% – 1.5%)
+
+The required metadata device capacity relative to data device capacity ($1.0\% \text{ to } 1.5\%$) is derived mathematically from the on-disk footprint of DNPFS core structures:
+
+1. **Level-1 Checksum Table Footprint ($0.488\%$):**
+   - Data Block Size: $4096 \text{ bytes}$ ($4\text{ KB}$).
+   - Per-block checksum entry: $20 \text{ bytes}$ ($8\text{B xxHash3} + 8\text{B block flags} + 4\text{B allocation metadata}$).
+   - Ratio: $\frac{20\text{ bytes}}{4096\text{ bytes}} \approx \mathbf{0.488\%}$ of total data capacity.
+
+2. **Inode Table & Extent Indirection Footprint ($0.39\%$ to $0.78\%$):**
+   - Struct inode size: $256 \text{ bytes}$.
+   - Default allocation ratio (1 inode per 16KB to 64KB data): $\approx \mathbf{0.39\% \text{ to } 0.78\%}$.
+
+3. **Journal WAL, Bad Block Maps, Reservation Tables & Transaction Manifests ($0.12\%$ to $0.23\%$):**
+   - Ring buffers, bad sector tracking maps, transaction manifests, and pre-operation snapshots consume $\approx \mathbf{0.12\% \text{ to } 0.23\%}$.
+
+$$\text{Total Metadata Ratio} = 0.488\% + (0.39\% \text{ to } 0.78\%) + (0.12\% \text{ to } 0.23\%) = \mathbf{1.0\% \text{ to } 1.5\%}$$
 
 ---
 
