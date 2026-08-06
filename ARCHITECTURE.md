@@ -167,37 +167,40 @@ DNPFS does not store a global dirty flag or active transaction counter in the su
 
 *Note on On-Disk Feature Flags:* Feature bitmasks (`compat_flags`, `incompat_flags`, `ro_compat_flags`) enable forward and backward format extensibility without requiring full format version bumps. Unrecognized `incompat_flags` cause `dnpfs.ko` to safely refuse mounting, while unrecognized `ro_compat_flags` force a read-only mount posture.
 
-*Note on Transaction Region Storage Model (Bootstrapping Solution):* The `/transactions/` path referenced in manifests is a virtual representation presented by userspace tools (`dnpfsd`, `dnpfs-dry`). Physically on disk, transactions are stored in a dedicated, fixed-offset **Transaction Region** (`transaction_region_offset` in the superblock, pre-allocated during `dnpfs-format`). Manifests are written as fixed-size raw slots in this metadata ring buffer. This completely eliminates any filesystem bootstrapping paradox during boot-time crash recovery: the recovery manager reads raw manifest slots from `transaction_region_offset` without needing to parse or mount a standard directory hierarchy first.
+*Note on Transaction Region Storage Model & Spillover Blocks (Bootstrapping & Variable Length Solution):* The `/transactions/` path referenced in manifests is a virtual representation presented by userspace tools (`dnpfsd`, `dnpfs-dry`). Physically on disk, transactions are stored in a dedicated, pre-allocated **Transaction Region** (`transaction_region_offset` in the superblock). Manifests are written into 1 KB raw header slots in this metadata ring buffer. Each 1 KB slot holds the manifest header and up to 32 inline extents. If a pathologically fragmented COW file requires more than 32 extents, the extra extent records spill over into chained **Transaction Spillover Metadata Blocks** pre-allocated on the metadata SSD. If the transaction ring buffer is completely filled with active pending transactions, new write allocation attempts block cleanly on a transaction wait-queue or return `ENOSPC` (active manifest slots are never evicted). This completely eliminates any bootstrapping paradox during boot-time crash recovery while safely supporting arbitrarily long extent maps.
 
 *Note on Growable Limits:* Like the inode table, the reservation table is **dynamically growable**. The `reservation_table_offset` points to a head block. As concurrent transactions increase, the driver allocates new metadata blocks dynamically (chained via `next_block` pointers), eliminating arbitrary bounds on transaction concurrency.
 
 *Note on Out-Of-Metadata-Space Failure Mode:* Metadata structures allocate space dynamically within the fixed metadata SSD volume formatted during `dnpfs-format`. If an extreme small-file workload exhausts the metadata SSD space (`free_inodes` or free metadata blocks reach 0), Phase 1 (Planning) intercepts all new write/copy allocation requests and rejects them cleanly with `ENOSPC` (No space left on device). Existing files on the volume remain fully intact and readable.
 
-### Inode
+### Inode (Fixed 256-byte Tagged Union Layout)
 
 ```
-inode_id:           u64
-file_size:          u64
-block_count:        u64
-link_count:         u32                — hardlink reference count (0 = free on delete)
-mode_flags:         u32                — file type (regular, directory, symlink) & mode bits
-extents:            [dnpfs_extent; 4]  — first 4 inline extents, 5th+ via indirect_extent_block
-indirect_extent_block: u64 | null      — points to secondary extent block on META device (indirection)
-symlink_target:     [u8; 255]          — inline symlink target path (if file type is symlink)
-created:            timestamp
-modified:           timestamp
-permissions:        u32
-owner:              u32
-flags:              u32                — bits: 0x1 = INODE_PENDING_COMMIT
-fallback_path_offset: u64 | null        — offset to source path on META device (Live-Migration Symlink Fallback)
-checksum:           u64  — xxhash3_64 of this inode structure
+inode_id:           u64                — 8 bytes
+file_size:          u64                — 8 bytes
+block_count:        u64                — 8 bytes
+link_count:         u32                — 4 bytes (hardlink reference count, 0 = free on delete)
+mode_flags:         u32                — 4 bytes (type discriminant: regular, dir, symlink + mode bits)
+payload:            union (128 bytes)  — discriminant-based tagged union:
+                      file_data: { extents: [dnpfs_extent; 4] (64B), indirect_extent_block: u64 (8B), reserved: [u8; 56] }
+                      symlink_target: [u8; 128] (inline symlink target path)
+created:            timestamp          — 8 bytes
+modified:           timestamp          — 8 bytes
+permissions:        u32                — 4 bytes
+owner:              u32                — 4 bytes
+flags:              u32                — 4 bytes (bits: 0x1 = INODE_PENDING_COMMIT)
+fallback_path_offset: u64              — 8 bytes (Live-Migration Symlink Fallback)
+reserved:           [u8; 56]           — 56 bytes padding to align struct to EXACTLY 256 bytes
+checksum:           u64                — 8 bytes (xxhash3_64 of inode structure)
 ```
+
+*Note on Tagged Union Inode Footprint (Exact 256-byte Guarantee):* `struct dnpfs_inode` utilizes a C tagged union (`payload`) discriminated by `mode_flags`. For regular files and directories, the 128-byte payload space holds 4 inline extents (64B) and the indirect extent block pointer (8B). For symlinks, the same 128-byte payload space holds the inline symlink target path. This guarantees that `sizeof(struct dnpfs_inode)` is **EXACTLY 256 bytes** for all file types, preserving the $1.0\% \text{ to } 1.5\%$ metadata sizing derivation and hardware table calculations with $100\%$ precision!
 
 *Note on Inode Table Capacity:* The inode table on the metadata SSD is dynamically growable. Unlike ext2/ext3's fixed-size tables formatted at creation time, DNPFS allocates metadata blocks in chained blocks of 512 inodes each as the number of files grows, eliminating the classic "out of inodes" constraint entirely.
 
 ### V1 POSIX File Type & Syscall Support (Symlinks, Hardlinks, xattrs, ACLs, mmap)
 
-* **Symlinks (V1 Native Support):** Symlink targets up to 255 bytes are stored inline within the inode (`symlink_target: [u8; 255]`), avoiding extra metadata block allocations. Symlink lookups are $O(1)$ directly from the inode. Fully supported in V1 for Plex/Jellyfin media libraries and dotfile management.
+* **Symlinks (V1 Native Support):** Symlink targets up to 128 bytes are stored inline within the inode payload (`symlink_target: [u8; 128]`), avoiding extra metadata block allocations. Symlink lookups are $O(1)$ directly from the inode. Fully supported in V1 for Plex/Jellyfin media libraries and dotfile management.
 * **Hardlinks (V1 Native Support):** Multiple directory entries may reference the same `inode_id`. The inode tracks references via `link_count: u32`. When a file is unlinked, `link_count` decrements; data blocks and metadata are freed only when `link_count` reaches 0. Fully supported in V1 for `rsync --link-dest` backup rotation.
 * **Extended Attributes (xattrs) & POSIX ACLs (Planned for V2):** xattr blocks and POSIX ACL permission structures are deferred to V2. V1 returns `ENOTSUP` for xattr/ACL syscalls (`getxattr`, `setxattr`).
 * **Explicit `mmap()` Compliance Policy:**
@@ -445,7 +448,7 @@ Unlike userspace leases, reservations in DNPFS are held strictly in RAM by the k
 * **Process Kills / Crashes (`SIGKILL`, OOM, abnormal exit):** If the writing process is killed or terminates prematurely while the OS kernel remains running, Linux VFS triggers standard file handle release callbacks (`f_op->release` / `f_op->flush`). The `dnpfs.ko` driver intercepts this callback, issues an **automatic transaction abort signal**, releases all held RAM reservations back to the free block bitmap, and deletes the pending manifest from `/transactions/`.
 * **Kernel Worker Deadlock / System Crash:** If an unrecoverable kernel thread deadlock or full OS crash occurs, the reservation remains held until the system reboots, at which point the boot-time recovery loop scans `/transactions/` and safely rolls back the interrupted transaction.
 * **Uninterruptible D-State Processes & Admin Override:** If a writing process gets stuck in an uninterruptible sleep state (D-state) due to physical I/O errors on a dying data HDD (preventing standard release callbacks from firing), system administrators can forcefully abort the transaction using the `dnpfs-dry --force-abort <transaction_id>` utility. This issues an explicit driver IOCTL (`DNPFS_IOC_ABORT_TRANSACTION`, requiring `CAP_SYS_ADMIN`), which forcefully revokes held RAM reservations, purges the manifest from `/transactions/`, and wakes up any blocked reader/writer threads with `EINTR`. *(Note on D-State Threads: Force-abort revokes the filesystem reservations and unblocks other processes waiting on the inode; the original stuck D-state thread itself remains blocked in the kernel block layer until the physical disk I/O completes or times out).*
-* **Automated Deadman's Switch (Unattended Escalation):** For headless NAS environments operating without a human administrator, `dnpfs.ko` implements an **Automated Deadman's Switch**. If an active transaction experiences zero physical I/O progress for longer than a configurable deadman threshold (default: 10 minutes), the kernel coordinator automatically marks the transaction `SUSPENDED_DEADMAN`, revokes held RAM reservations to prevent starving other transactions, purges the manifest from the transaction region, and logs a critical alert to `syslog`/`dnpfsd`.
+* **Automated Deadman's Switch (Unattended Escalation & Block Quarantine):** For headless NAS environments operating without a human administrator, `dnpfs.ko` implements an **Automated Deadman's Switch**. If an active transaction experiences zero physical I/O progress for longer than a configurable deadman threshold (default: 10 minutes), the kernel coordinator automatically marks the transaction `SUSPENDED_DEADMAN`, unblocks waiting threads with `ETIMEDOUT`/`EIO`, and logs a critical emergency alert to `syslog`/`dnpfsd`. **Critical Safety Rule:** To prevent double-allocation write corruption from zombie I/O landing late on reused sectors, the Deadman's Switch **never releases or reclaims target data blocks into the free allocation bitmap**. Instead, the target block range is transitioned to a locked `QUARANTINED_DEADMAN` state, keeping the blocks strictly immune to re-allocation until either: (1) the underlying D-state thread physically resolves in the kernel block layer, or (2) an administrator explicitly issues `dnpfs-dry --force-abort` after confirming hardware replacement.
 
 ---
 
@@ -948,7 +951,7 @@ Multiple processes may attempt operations simultaneously. DNPFS handles this wit
 - **Multiple Allocation Manifests:** Rather than a single global file, each active transaction utilizes a dedicated `allocation_<write_id>.dry` manifest. This reduces write contention and allows independent operations to proceed concurrently.
 - Two operations may not hold overlapping block reservations.
 - Reservations are granted in order of request.
-- **Starvation Prevention & Priority Aging:** To prevent long-running reservations from starving smaller overlapping write requests indefinitely, the reservation coordinator implements **Priority Aging**. Reservation waiters accumulate priority based on wait duration ($\text{priority} = \text{wait\_time\_ms} \times \text{weight}$). If a waiter's target block range overlaps a long-held reservation and waits longer than 5,000 ms, the coordinator elevates its priority to `HIGH_PRIORITY_INHERITANCE`, pausing new non-conflicting reservations until the aged waiter is granted allocation space.
+- **Starvation Prevention & Priority Aging:** To prevent long-running reservations from starving smaller overlapping write requests indefinitely, the reservation coordinator implements **Priority Aging**. Reservation waiters accumulate priority based on wait duration ($\text{priority} = \text{wait\_time\_ms} \times \text{weight}$). If a waiter's target block range overlaps a long-held reservation and waits longer than 5,000 ms, the coordinator elevates its priority to `RANGE_PRIORITY_INHERITANCE`, pausing new allocation requests **strictly for transactions whose requested block range overlaps the contended span**. Unrelated non-overlapping transactions across the volume continue to allocate and execute in parallel without any global system stall.
 - A new dry run that would require blocks already reserved must wait or fail with a retry signal.
 - Directory entry locks are held for the duration of any operation that modifies directory structure.
 - Read operations do not require reservations but do check the TRIM suppression list:
