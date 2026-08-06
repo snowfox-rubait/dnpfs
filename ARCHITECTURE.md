@@ -999,7 +999,7 @@ The meta device is an SSD or flash storage. Logical fragmentation on SSDs does n
 - Defragmentation is limited to the meta device — the data device is treated as a large sequential store and is not defragmented
 - **Idle Extent Coalescing Engine (COW Defragmenter):** While the data HDD is not defragmented via traditional block moving (to preserve sequential layout), `dnpfsd` includes an **Extent Coalescing Engine**. During extended idle periods, `dnpfsd` scans inodes whose extent count exceeds 4 inline extents due to Copy-On-Write fragmentation. It allocates a contiguous block span on the DATA device, copies the file's extents into the contiguous span using a single Phase 1–6 COW transaction, and updates the inode back to a single contiguous extent (freeing old fragmented extents). This prevents pathologically fragmented COW files from degrading read throughput over time.
 - If defragmentation is in progress and a new operation arrives, defragmentation pauses immediately, the operation proceeds normally, and defragmentation resumes afterward
-- A brief user-visible notification is shown if defragmentation cannot pause fast enough (expected duration: seconds on a 16GB device)
+- `dnpfsd` issues a brief desktop notification via Netlink if defragmentation cannot pause fast enough (expected duration: seconds on a 16GB device)
 
 ---
 
@@ -1061,7 +1061,7 @@ dnpfs-import --backup meta-backup.img --data-device /dev/sdX
 
 These are real constraints users should understand before adopting DNPFS. They are accepted tradeoffs, not bugs.
 
-**Not portable natively.** DNPFS requires a custom driver or userspace FUSE runner on hosts that mount the volume. To solve this, DNPFS volumes formatted with the optional **Self-Contained Plug-and-Play Bootstrap Partition (`DNPFS_BOOTSTRAP`)** embed a 256MB FAT32 partition containing standalone `dnpfs-fuse` AppImage binaries, DKMS driver packages, and mount scripts. This allows any computer to immediately mount the volume without downloading external software.
+**Not portable natively.** DNPFS requires a custom driver or userspace FUSE runner on hosts that mount the volume. To solve this, DNPFS volumes formatted with the optional **Self-Contained Plug-and-Play Bootstrap Partition (`DNPFS_BOOTSTRAP`)** embed a 512MB FAT32 partition containing standalone `dnpfs-fuse` AppImage binaries (x86_64 and AArch64 Linux), DKMS driver packages, and mount scripts. This allows any computer to immediately mount the volume without downloading external software.
 
 **Not bootable.** By design. DNPFS is a storage filesystem. The OS cannot boot from it because the kernel module is not loaded at boot time. This is a conscious tradeoff accepted at the design stage.
 
