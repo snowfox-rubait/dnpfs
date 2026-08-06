@@ -131,7 +131,7 @@ free_inodes:        u64
 root_inode:         u64
 last_mount_time:    timestamp
 last_write_time:    timestamp
-dirty_flag:         bool  — set on mount, cleared on clean unmount
+active_transaction_count: u32  — number of active, uncommitted transactions (marked dirty if > 0)
 journal_offset:     u64
 checksum_table_offset: u64
 bad_block_map_offset:  u64
@@ -139,7 +139,7 @@ reservation_table_offset: u64
 superblock_checksum: sha256
 ```
 
-The `dirty_flag` is the primary crash detection mechanism. If it is set on mount, crash recovery is triggered automatically.
+The `active_transaction_count` is the primary crash detection mechanism. If it is greater than 0 on mount, crash recovery is triggered automatically for all pending transaction manifests.
 
 ### Inode
 
@@ -427,6 +427,12 @@ PHASE 6: OPTIONAL BACKUP TRIGGER
 ```
 
 Delete operations follow the same flow but in reverse — reservation holds the blocks being freed, metadata is updated first to remove pointers, data blocks are released last, then TRIM is issued only after confirmation.
+
+### Random Writes and Truncations (Copy-On-Write)
+
+To achieve VFS compliance and prevent data corruption, DNPFS does not support in-place block overwrites on the primary data device. All random writes (`pwrite`), file truncations (`ftruncate`), and in-place modifications are implemented using **Copy-On-Write (COW)**:
+* **Random Writes:** When writing to an arbitrary offset in an existing file, the driver allocates a new extent range for the modified blocks, writes the updated data, verifies its checksum, and then updates the inode's extent mapping table to point to the new blocks. The old blocks are subsequently freed.
+* **Truncations:** For file shrinking, the driver updates the file size in the inode and marks the unmapped trailing extents as free in the allocation bitmap. For file expansion, it allocates a zero-filled extent or updates the file size metadata (supporting sparse files).
 
 ### Safe Move Operations (Copy-Verify-Delete)
 
@@ -819,7 +825,8 @@ Multiple processes may attempt operations simultaneously. DNPFS handles this wit
 
 ### Rules
 
-- **Write Ordering:** Concurrent writes are sorted in order of arrival (FIFO queue) by the metadata coordinator.
+- **Parallel Execution:** Transactions that target disjoint (non-overlapping) block ranges and modify non-conflicting directory paths are executed and written in parallel.
+- **Group Commits (WAL Coalescing):** Rather than performing a synchronous FUA flush on the metadata SSD for every single transaction (which serializes throughput), `dnpfs.ko` coalesces concurrent metadata commits into a single physical FUA write. Multiple active writes write their metadata blocks to the in-memory log, and a single coordinator thread flushes the WAL head in one operation.
 - **Multiple Allocation Manifests:** Rather than a single global file, each active transaction utilizes a dedicated `allocation_<write_id>.dry` manifest. This reduces write contention and allows independent operations to proceed concurrently.
 - Two operations may not hold overlapping block reservations.
 - Reservations are granted in order of request.
@@ -827,9 +834,9 @@ Multiple processes may attempt operations simultaneously. DNPFS handles this wit
 - Directory entry locks are held for the duration of any operation that modifies directory structure.
 - Read operations do not require reservations but do check the TRIM suppression list — a read of a reserved block returns the pre-reservation data (reads the current on-disk state, not the pending state).
 
-### Queue
+### Queue & Coordination
 
-The reservation table on the meta device serves as the coordination point. All operations write their individual `allocation_<write_id>.dry` reservation before execution. Conflicts are detected at reservation time, not at execution time — this prevents silent overwrites.
+The reservation table on the meta device serves as the coordination point. All operations write their individual `allocation_<write_id>.dry` reservation before execution. Conflicts are detected at reservation time, not at execution time — this prevents silent overwrites. Non-conflicting transactions bypass the FIFO queue and execute in parallel.
 
 ---
 
