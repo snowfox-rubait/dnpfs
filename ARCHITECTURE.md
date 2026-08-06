@@ -258,6 +258,12 @@ To verify data integrity without redundant metadata reads, the routine health ch
        → Mismatch: Flag bad sector(s) and trigger bad sector handling.
 ```
 
+### Advanced Checksum Grouping (Planned for V2)
+
+> [!NOTE]
+> **V1 Implementation Constraint:** The following dynamic write-time checksum tiering and deferred checksumming features introduce significant state-management complexity for the background daemon. For the initial MVP, DNPFS will strictly use a flat, static 100-block group size for all writes, computing individual checksums immediately in Phase 4. These optimizations are deferred to V2.
+
+<!--
 **Write-Time Dynamic Checksum Grouping by File Size**
 
 To optimize performance and metadata overhead during write operations (copy-paste), DNPFS dynamically scales checksum group sizes based on file sizes at write time:
@@ -280,6 +286,7 @@ To achieve high write-performance, DNPFS implements **Deferred Checksumming** du
 * **File-level grouping** is a logical transaction-bundling utility used strictly during Phase 1–3 of writes to group multiple small files into a single contiguous extent range allocation in the manifest, saving write-overhead.
 * **Block-level grouping** (the static 100-block table) is the physical layout format on the metadata SSD. Once a file transaction is committed, its allocated blocks are registered within these static 100-block on-disk groups, which are subsequently managed and verified by the background scrubber.
 * **Group Checksum Invalidation on Block Release:** When blocks are freed (e.g. during a Copy-On-Write update or file deletion), the affected 100-block group checksum on the SSD is marked as "stale/dirty" by setting its status flag to `suspect`. During the next background scrub or idle period, `dnpfsd` recomputes the group checksum from the remaining active block hashes.
+-->
 
 ### Why This Matters for Small Files
 
@@ -733,6 +740,12 @@ DNPFS does not implement its own cryptography. Encryption is provided by **dm-cr
 
 DNPFS sits on top of LUKS volumes. The OS presents decrypted block devices to the DNPFS driver, which operates normally regardless of whether encryption is active underneath.
 
+### Dual-Mode LUKS Chaining (Planned for V2)
+ 
+> [!NOTE]
+> **V1 Implementation Constraint:** The following multi-mode encryption and key-chaining logic requires custom userspace unlocking hooks that are too complex for an MVP. For V1, DNPFS simply expects the underlying block devices to be already decrypted by the OS (via standard `cryptsetup`) before the filesystem is mounted. The native driver will not handle LUKS key derivations internally.
+
+<!--
 ### Four Encryption Modes
 
 Users select an encryption mode during `dnpfs-format`. The mode is stored in the superblock and enforced at mount time.
@@ -782,6 +795,7 @@ luks_uuid_data:     uuid | null
 ### Key Storage in Mode 3
 
 The data device LUKS key material is stored encrypted on the meta device, protected by the same passphrase. If the meta device is lost, the data device key is also lost — this is by design and is consistent with the principle that the meta device is the authoritative root of the volume.
+-->
 
 ---
 
