@@ -108,11 +108,11 @@ If you see a problem with the architecture, that is the most valuable thing you 
 
 | Role | Recommended | Minimum |
 |---|---|---|
-| Metadata device | SSD: ≥1.5% of Data capacity (e.g., 32GB SSD for 2TB HDD) | SSD: ≥1.0% of Data capacity (e.g., 16GB SSD for 1.6TB HDD) |
+| Metadata device | SSD: ≥1.5% to 2.3% of Data capacity (e.g., 32GB–48GB SSD for 2TB HDD) | SSD: ≥1.0% of Data capacity (e.g., 16GB SSD for 1.6TB HDD) |
 | Data device | Any HDD or SSD | Any block device |
 | Metadata device interface | SATA SSD or NVMe | USB flash (not recommended for production) |
 
-*Note on Metadata Sizing:* Level-1 64-bit checksums, dynamically growable inodes, and active transaction manifests consume metadata space proportional to the block count of the data device. A ratio of 1.0% to 1.5% of the data drive's capacity is required for optimal operation.
+*Note on Metadata Sizing:* Level-1 64-bit checksums, dynamically growable inodes, and active transaction manifests consume metadata space proportional to the block count of the data device. A ratio of 1.0% to 1.5% of the data drive's capacity is required for standard workloads, while dense small-file workloads (e.g., 16KB per inode) require up to ~2.3% metadata capacity.
 
 The metadata device is your most critical component. If it fails without a backup, the data device becomes a pile of unaddressed raw blocks. Treat it accordingly. Use reliable hardware, keep backups, and consider RAID 1 on the metadata device for zero-downtime failure handling.
 
