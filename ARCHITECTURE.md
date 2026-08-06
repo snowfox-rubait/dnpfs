@@ -163,6 +163,8 @@ DNPFS does not store a global dirty flag or active transaction counter in the su
 
 *Note on Growable Limits:* Like the inode table, the reservation table is **dynamically growable**. The `reservation_table_offset` points to a head block. As concurrent transactions increase, the driver allocates new metadata blocks dynamically (chained via `next_block` pointers), eliminating arbitrary bounds on transaction concurrency.
 
+*Note on Out-Of-Metadata-Space Failure Mode:* Metadata structures allocate space dynamically within the fixed metadata SSD volume formatted during `dnpfs-format`. If an extreme small-file workload exhausts the metadata SSD space (`free_inodes` or free metadata blocks reach 0), Phase 1 (Planning) intercepts all new write/copy allocation requests and rejects them cleanly with `ENOSPC` (No space left on device). Existing files on the volume remain fully intact and readable.
+
 ### Inode
 
 ```
@@ -263,6 +265,9 @@ Group 0 (blocks 0–99):   xxhash3_64 of [checksum0 + checksum1 + ... + checksum
 Group 1 (blocks 100–199): xxhash3_64 of [checksum100 + ... + checksum199]
 ```
 
+**V1 Group Checksum Maintenance under COW & Deletions:**
+In V1, whenever a Copy-On-Write write or file deletion allocates new blocks or releases existing ones, the Level 2 group checksums for all affected 100-block groups are **synchronously updated in Phase 5 (Confirmation)**. Because Level 2 group hashes are calculated in RAM directly from the active 64-bit Level 1 block checksums (without needing to re-read data blocks from the physical HDD), synchronous group checksum updates incur zero physical disk I/O overhead. This guarantees that on-disk Level 2 group checksums remain 100% consistent across all COW operations in V1.
+
 **Routine health check flow (Data Verification / Scrubbing):**
 
 To verify data integrity without redundant metadata reads, the routine health check (scrubber) follows this flow:
@@ -330,6 +335,7 @@ member_count:       u32
 
 To protect against random DRAM corruption (e.g., from cosmic rays or faulty non-ECC memory modules), DNPFS implements double-checksum validation in transit:
 * **Write Path:** When a page is dirty-marked in the kernel page cache by VFS, the driver immediately computes a temporary 64-bit checksum and stores it in the page's VFS private descriptor in RAM. During Phase 4 (Execution), right before sending the block to the disk controller, the driver recomputes the checksum in RAM and verifies it against the dirty-page descriptor. If a mismatch is detected, the transaction aborts, the page is discarded, a kernel warning is issued, and VFS is requested to rewrite the block from cache.
+* **Long-Dwelling Dirty Pages:** Dirty pages in the page cache are validated upon initial VFS dirtying and immediately prior to Phase 4 disk submission. If dirty pages remain uncommitted in memory for extended periods, standard Linux page cache flusher threads (`wb_workfn` / `pdflush`) trigger periodic flushes, executing Phase 4 transit verification before memory pressure eviction occurs. Continuous background polling of in-RAM dirty pages is explicitly out of scope to avoid memory bus bandwidth contention.
 * **Read Path (Optional):** By default, checksums are verified only when a block is first read from the physical HDD into the kernel page cache. Subsequent cache-hit reads bypass checksum re-evaluation to preserve memory throughput. For environments requiring extreme paranoia, a mount flag (`verify=paranoid_cache`) can be enabled to force the driver to recompute the xxHash3 checksum right before copying data from the page cache to the userspace buffer on *every* `read()` syscall. If a RAM bit-flip is detected, the page is discarded and reloaded from the HDD.
 * **Hardware Recommendation:** While transit checksumming protects data under the filesystem's direct control, it cannot protect data once it is copied to the application's private memory. DNPFS strongly recommends **ECC (Error-Correcting Code) RAM** for production deployments.
 
@@ -708,6 +714,9 @@ Checksum mismatch detected during file read or background scrubbing:
   → Log critical bit-rot alert with filename, offset, and block ID
   → Note: Automatic recovery is impossible without an external backup or secondary mirror
 ```
+
+**Bad Block Map Sizing & Thresholds:**
+Each entry in `bad_block_map` is a compact 16-byte record (`sector_offset` u64 + `flags` u64). Even on a severely degraded HDD with 10,000 bad sectors, the total map consumes only ~160 KB of metadata space. If bad sector accumulation exceeds a configurable threshold (default: 5,000 bad sectors), `dnpfsd` issues a critical drive health warning advising immediate hardware replacement. No bad sector entries are evicted; records are retained permanently to prevent re-allocation of defective sectors for the lifetime of the paired volume.
 
 ### allocation.dry Integration
 

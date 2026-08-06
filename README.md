@@ -43,7 +43,7 @@ DNPFS eliminates that entirely.
 
 **Block-layer Encryption via LUKS.** Encryption is applied at the standard Linux block layer (`dm-crypt`/LUKS) beneath DNPFS. Devices are unlocked via standard OS utilities (`cryptsetup`) prior to mounting. *(Native driver-managed key chaining is planned for V2).*
 
-**RAID compatible.** DNPFS works on top of any mdadm or dm-raid array transparently. RAID 1 on the metadata device is strongly recommended for high-availability setups and eliminates the metadata single point of failure entirely.
+**RAID compatible.** DNPFS works on top of any mdadm or dm-raid array transparently. RAID 1 on the metadata device is strongly recommended for high-availability setups and significantly reduces metadata hardware failure risk.
 
 **Copy-On-Write (COW) modifications.** To maintain strict transactional safety, random writes (`pwrite`) and truncations (`ftruncate`) use Copy-On-Write rather than in-place block updates. Edits allocate new block extents, keeping the old data intact until the write successfully verifies and commits. *(Note: COW random-access writes incur metadata extent growth and checksum group write churn; DNPFS is structurally optimized for bulk sequential storage rather than random write-heavy database workloads).*
 
