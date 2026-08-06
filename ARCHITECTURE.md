@@ -153,7 +153,8 @@ created:            timestamp
 modified:           timestamp
 permissions:        u32
 owner:              u32
-flags:              u32
+flags:              u32                — bits: 0x1 = INODE_PENDING_COMMIT
+fallback_path_offset: u64 | null        — offset to source path on META device (Live-Migration Symlink Fallback)
 checksum:           sha256  — checksum of this inode structure
 ```
 
@@ -203,7 +204,7 @@ manifest_path:      path to allocation.dry
 blocks_held:        [u64]  — data device block addresses
 created:            timestamp
 expires:            timestamp
-operation_type:     enum { write, delete, move, rename }
+operation_type:     enum { write, delete, copy, rename }
 status:             enum { pending, committed, rolled_back, expired }
 ```
 
@@ -296,7 +297,7 @@ The `allocation.dry` file is the cornerstone of DNPFS crash recovery and write v
 ```yaml
 manifest_version: 1
 manifest_id: uuid
-operation_type: write | delete | move
+operation_type: write | delete | copy
 created: timestamp
 expires: timestamp
 reservation_id: uuid
@@ -369,7 +370,7 @@ For active, long-running writes, the writing process must periodically send a he
 
 ## Transaction Lifecycle
 
-Every operation — write, delete, move, rename — follows the same unified transaction model.
+Every operation — write, delete, copy, rename — follows the same unified transaction model. Direct cross-device `move` operations are banned (see below).
 
 ```
 PHASE 1: PLANNING
@@ -419,6 +420,24 @@ PHASE 6: OPTIONAL BACKUP TRIGGER
 ```
 
 Delete operations follow the same flow but in reverse — reservation holds the blocks being freed, metadata is updated first to remove pointers, data blocks are released last, then TRIM is issued only after confirmation.
+
+### Safe Move Operations (Copy-Verify-Delete)
+
+To eliminate data loss risks from partial or interrupted moves, direct metadata-only "move" operations across devices are banned. Move operations are implemented explicitly as a three-phase transaction:
+1. **Copy Phase:** All target data blocks are sequentially copied to the DNPFS device using standard write reservations.
+2. **Verification Phase:** The driver performs cryptographic block checksum comparisons (xxHash3/CRC32C) and file-level verification (SHA-256) between the source and destination.
+3. **Delete Phase:** Only after verification successfully confirms data identity, the driver issues a secure delete operation to the original source file.
+
+### Live-Migration Symlink Fallback
+
+To prevent active readers from experiencing read blocks or downtime during a slow copy/move operation, DNPFS implements a metadata-level **Live-Migration Symlink Fallback** redirection:
+* **Pending Commit Flag:** When a write/copy begins, the inode is created immediately on the metadata device with the `INODE_PENDING_COMMIT` flag set in its `flags` field.
+* **Source Redirection:** The `fallback_path_offset` field in the inode points to the file path of the original source file on the host OS.
+* **Syscall Interception:**
+  * `read()` / `open(O_RDONLY)`: The VFS driver intercepts read requests to the pending inode and transparently redirects them to read from the original source file.
+  * `write()` / `open(O_WRONLY)`: Any write operations requested by other processes return `EBUSY`.
+  * `rename()` / `unlink()`: Directory modifications on pending inodes return `EBUSY`.
+* **Atomic Promotion:** Once the copy completes and passes checksum validation, the driver atomically clears the `INODE_PENDING_COMMIT` flag and the `fallback_path_offset` field, promoting the file to a standard local DNPFS inode. If a move was requested, the source file deletion is then safely triggered.
 
 ---
 

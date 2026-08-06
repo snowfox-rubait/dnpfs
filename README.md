@@ -43,7 +43,7 @@ DNPFS eliminates that entirely.
 
 **RAID compatible.** DNPFS works on top of any mdadm or dm-raid array transparently. RAID 1 on the metadata device is strongly recommended for high-availability setups and eliminates the metadata single point of failure entirely.
 
-**Unified transaction model.** Writes, deletes, moves, and renames all follow the same lifecycle: plan → dry run → reserve → execute → verify → confirm. Every operation is recoverable at every stage.
+**Unified transaction model.** Writes, deletes, copies, and renames all follow the same lifecycle: plan → dry run → reserve → execute → verify → confirm. Every operation is recoverable at every stage. Direct cross-device moves are banned and replaced by a secure Copy-Verify-Delete pipeline, featuring a Live-Migration Symlink Fallback to guarantee zero-downtime read redirection during copying.
 
 ---
 
