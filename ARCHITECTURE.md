@@ -182,11 +182,12 @@ To prevent overflow in pathologically fragmented files, indirect blocks are chai
 
 ### Block Checksum Table Entry
 
+The checksum table is stored as a flat array on the metadata SSD, indexed directly by the data device's block number. This eliminates the need to store individual block offsets in each entry.
+
 ```
-data_block_offset:  u64   — sector address on DATA device
-checksum:           u64   — 64-bit xxHash3 or CRC32C checksum
-last_verified:      timestamp
-status:             enum { good, suspect, bad, remapped }
+checksum:           u64   — 64-bit xxHash3 or CRC32C checksum (8 bytes)
+last_verified:      timestamp (8 bytes)
+status:             enum { good, suspect, bad, remapped } (4 bytes packed/padded)
 ```
 
 ### Bad Block Map Entry
@@ -218,7 +219,10 @@ DNPFS uses a two-level checksum architecture that balances precision with perfor
 
 ### Level 1 — Individual Block Checksums
 
-Every data block has a compact 64-bit xxHash3 (or CRC32C) checksum stored in the checksum table on the metadata device. This provides a low-overhead, precise, per-block verification footprint (20 bytes per block entry, equivalent to ~0.48% of the data drive capacity), making it small enough to fit within SSD metadata devices. xxHash3 is used for both individual block validation and complete file-level verification, keeping the entire pipeline non-cryptographic and highly performant.
+Every data block has a compact 64-bit xxHash3 (or CRC32C) checksum stored in the checksum table on the metadata device. This provides a low-overhead, precise, per-block verification footprint (exactly 20 bytes per block entry, equivalent to ~0.48% of the data drive capacity), making it small enough to fit within SSD metadata devices. xxHash3 is used for both individual block validation and complete file-level verification, keeping the entire pipeline non-cryptographic and highly performant.
+
+> [!NOTE]
+> **Threat Model Assumption:** DNPFS assumes a non-adversarial threat model (protecting against silent bit rot, cosmic rays, and sector/firmware errors rather than malicious cryptographic tampering). Consequently, non-cryptographic xxHash3 is used exclusively; collision resistance against malicious forgery is an accepted trade-off and is out of scope.
 
 ```
 Block 400000 → xxhash3: 0xA3F9B2C10D2E4A9F
@@ -933,11 +937,11 @@ These are real constraints users should understand before adopting DNPFS. They a
 
 These are fundamental constraints that cannot be engineered away, only mitigated.
 
-### The Two Generals Problem
+### Metadata/Data Time-Gap Recovery
 
-Two physically separate devices cannot achieve perfect atomic consensus over an unreliable channel (power, cable, firmware). There exists a theoretical minimum failure window — a microsecond gap between meta device confirmation and data device write — where power loss produces an undetectable inconsistency.
+Two physically separate devices cannot achieve native hardware-level atomic synchronization during a crash. There exists a microsecond gap between the metadata device confirmation and the data device write where power loss can occur. 
 
-DNPFS minimizes this window with FUA, write ordering, and journal replay, but cannot eliminate it. The allocation.dry manifest provides recovery from all detectable failures. Failures within the minimum window are accepted as a known theoretical risk with negligible real-world probability under normal hardware.
+DNPFS resolves this by defining strict write-ordering boundaries using WAL transactions. If power is lost during this time-gap, recovery is fully deterministic: the boot-time recovery manager reads the active manifests and replays or rolls back the metadata to match the physical blocks actually written on the data drive, preventing any silent metadata-data mismatches.
 
 ### Drive Firmware Lies
 
