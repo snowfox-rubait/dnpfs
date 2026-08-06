@@ -123,7 +123,7 @@ The required metadata device capacity relative to data device capacity ($1.0\% \
 
 2. **Inode Table & Extent Indirection Footprint ($0.39\%$ to $0.78\%$):**
    - Struct inode size: $256 \text{ bytes}$.
-   - Default allocation ratio (1 inode per 16KB to 64KB data): $\approx \mathbf{0.39\% \text{ to } 0.78\%}$.
+   - Default allocation ratio (1 inode per 32KB to 64KB data): $\approx \mathbf{0.39\% \text{ to } 0.78\%}$ ($\frac{256\text{B}}{65536\text{B}} = 0.39\%$, $\frac{256\text{B}}{32768\text{B}} = 0.78\%$).
 
 3. **Journal WAL, Bad Block Maps, Reservation Tables & Transaction Manifests ($0.12\%$ to $0.23\%$):**
    - Ring buffers, bad sector tracking maps, transaction manifests, and pre-operation snapshots consume $\approx \mathbf{0.12\% \text{ to } 0.23\%}$.
@@ -408,11 +408,14 @@ confirmation:
 15. Optionally trigger meta backup if threshold exceeded
 ```
 
-### Indefinite Kernel Reservations (No Wall-Clock Expiry)
+### Indefinite Kernel Reservations & Process Abort Handling
 
-Unlike userspace leases, reservations in DNPFS are held strictly in RAM by the kernel's transaction coordinator. They **do not expire based on wall-clock time**. 
+Unlike userspace leases, reservations in DNPFS are held strictly in RAM by the kernel's transaction coordinator. They **do not expire based on wall-clock time**, completely eliminating mid-runtime double-allocation races.
 
-For active, long-running writes, the kernel driver simply maintains the reservation indefinitely until the physical write completes. Once the transaction explicitly commits or aborts, the driver atomically releases the reservation. The only scenario where a reservation "times out" is if the entire OS crashes; upon the next boot, the recovery loop scans the `/transactions/` directory and safely rolls back/releases any dangling reservations left by the interrupted kernel thread. This fully eliminates any risk of lease-expiry double-allocation races mid-runtime.
+**Process Termination & Abort Handling:**
+* **Active Writes:** For long-running writes, the kernel driver maintains the reservation in RAM until the write physically completes and commits.
+* **Process Kills / Crashes (`SIGKILL`, OOM, abnormal exit):** If the writing process is killed or terminates prematurely while the OS kernel remains running, Linux VFS triggers standard file handle release callbacks (`f_op->release` / `f_op->flush`). The `dnpfs.ko` driver intercepts this callback, issues an **automatic transaction abort signal**, releases all held RAM reservations back to the free block bitmap, and deletes the pending manifest from `/transactions/`.
+* **Kernel Worker Deadlock / System Crash:** If an unrecoverable kernel thread deadlock or full OS crash occurs, the reservation remains held until the system reboots, at which point the boot-time recovery loop scans `/transactions/` and safely rolls back the interrupted transaction.
 
 ---
 
