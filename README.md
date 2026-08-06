@@ -91,16 +91,19 @@ If you see a problem with the architecture, that is the most valuable thing you 
 
 ---
 
-## Planned Components
+## Planned Components & Implementation Strategy
 
-- `dnpfs.ko` — Linux kernel module implementing the VFS interface
-- `dnpfsd` — userspace daemon for S.M.A.R.T. polling, backup scheduling, and orphan transaction monitoring
+To eliminate kernel-space development risks and iterate safely, implementation follows a two-stage roadmap: **Phase 1 (FUSE Prototype & Tooling)** followed by **Phase 2 (Production Kernel Module)**.
+
+- `dnpfs-fuse` — userspace FUSE prototype to validate transaction lifecycles, dry-runs, and crash-injection recovery in userspace before kernel porting
 - `dnpfs-format` — formats a paired meta + data volume
+- `dnpfs.ko` — production Linux kernel module implementing the native VFS interface
+- `dnpfsd` — userspace daemon for S.M.A.R.T. polling, backup scheduling, and orphan transaction monitoring
 - `dnpfs-check` — two-device filesystem check tool
 - `dnpfs-recover` — forensic recovery using `allocation.dry` manifests
 - `dnpfs-backup` — metadata backup and restore
 - `dnpfs-smart` — S.M.A.R.T. status report for both devices
-- `dnpfs-dry` — inspect, confirm, or cancel pending dry run manifests
+- `dnpfs-dry` — inspect, confirm, or forcefully abort pending dry run manifests
 
 ---
 

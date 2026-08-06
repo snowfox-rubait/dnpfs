@@ -201,6 +201,7 @@ To prevent overflow in pathologically fragmented files, indirect blocks are chai
   * `next_indirect_block: u64` — offset of the next indirect metadata block, or `null` (8 bytes)
   * `padding/reserved: u64` — 8 bytes aligned padding
 * If the number of extents exceeds 259 (4 inline + 255 in the first indirect block), a new 4 KB indirect block is allocated on the metadata device and chained via the `next_indirect_block` pointer.
+* **In-RAM Extent Index Cache ($O(\log E)$ Lookups):** On disk, indirect extent blocks use chained 4 KB blocks for format v1 simplicity. To prevent $O(N)$ traversal overhead for heavily fragmented COW files in memory, `dnpfs.ko` builds a compact in-RAM **Extent Index Cache** (a sorted red-black tree / dynamic array over file block offsets) when an inode is opened into the VFS inode cache. Reads and writes perform binary search ($O(\log E)$) over this in-RAM index cache rather than walking the on-disk linked list. A B-tree on-disk extent layout is planned for format v2.
 
 ---
 
@@ -313,11 +314,11 @@ To achieve high write-performance, DNPFS implements **Deferred Checksumming** du
 * **Group Checksum Invalidation on Block Release:** When blocks are freed (e.g. during a Copy-On-Write update or file deletion), the affected 100-block group checksum on the SSD is marked as "stale/dirty" by setting its status flag to `suspect`. During the next background scrub or idle period, `dnpfsd` recomputes the group checksum from the remaining active block hashes.
 -->
 
-### Why This Matters for Small Files
+### Checksum Amortization for Small Files
 
-Per-block checksums have disproportionate overhead for small files. An 8-byte xxhash3_64 checksum on a 100-byte file is 8% overhead just for the checksum entry, not counting inode and directory cost. Group checksums amortize this — the group check covers multiple files in one operation. Individual checksums for small files still exist but are only read when the group check fails.
+Per-block checksums have a fixed storage overhead (20 bytes per 4KB block, or ~0.49%). For routine background verification (scrubbing), Level 2 group checksums amortize metadata read latency: the scrubber reads a 100-block span from the data device, computes the candidate group hash in RAM, and compares it against a single Level 2 group checksum on the metadata SSD. Individual Level 1 block checksums are evaluated only if a group checksum mismatch is detected.
 
-For very small files (below a configurable threshold, suggested: 4KB), a future optimization may store the file content inline on the meta device entirely, eliminating the data device round-trip and the need for a block-level checksum for those files.
+*(Note: Inline storage for very small files < 4KB on the metadata SSD is planned for V2).*
 
 ### Group Checksum Data Structure
 
@@ -423,6 +424,7 @@ Unlike userspace leases, reservations in DNPFS are held strictly in RAM by the k
 * **Active Writes:** For long-running writes, the kernel driver maintains the reservation in RAM until the write physically completes and commits.
 * **Process Kills / Crashes (`SIGKILL`, OOM, abnormal exit):** If the writing process is killed or terminates prematurely while the OS kernel remains running, Linux VFS triggers standard file handle release callbacks (`f_op->release` / `f_op->flush`). The `dnpfs.ko` driver intercepts this callback, issues an **automatic transaction abort signal**, releases all held RAM reservations back to the free block bitmap, and deletes the pending manifest from `/transactions/`.
 * **Kernel Worker Deadlock / System Crash:** If an unrecoverable kernel thread deadlock or full OS crash occurs, the reservation remains held until the system reboots, at which point the boot-time recovery loop scans `/transactions/` and safely rolls back the interrupted transaction.
+* **Uninterruptible D-State Processes & Admin Override:** If a writing process gets stuck in an uninterruptible sleep state (D-state) due to physical I/O errors on a dying data HDD (preventing standard release callbacks from firing), system administrators can forcefully abort the transaction using the `dnpfs-dry --force-abort <transaction_id>` utility. This issues an explicit driver IOCTL (`DNPFS_IOC_ABORT_TRANSACTION`, requiring `CAP_SYS_ADMIN`), which forcefully revokes held RAM reservations, purges the manifest from `/transactions/`, and wakes up any blocked threads with `EINTR`.
 
 ---
 
@@ -604,7 +606,7 @@ Runs as a background service. Handles:
 - `dnpfs-recover` — forensic recovery tool, imports allocation.dry for partial write analysis
 - `dnpfs-backup` — manual meta device backup and restore
 - `dnpfs-smart` — S.M.A.R.T. status report for both devices
-- `dnpfs-dry` — inspect, confirm, or cancel pending dry run manifests
+- `dnpfs-dry` — inspect, confirm, or forcefully abort pending dry run manifests (via DNPFS_IOC_ABORT_TRANSACTION)
 
 ---
 
@@ -623,6 +625,7 @@ Drive firmware can confirm a write while data is still in the drive's internal v
 **Explicit write ordering (Split-Path Design):**
 To reconcile transactional safety with wear mitigation, DNPFS separates log writes from actual structural updates:
 * **The Log Path (Synchronous WAL):** The planning manifest (`allocation.dry`) and confirmation markers are written sequentially to the Write-Ahead Log (WAL) on the metadata SSD using synchronous FUA flushes.
+* **Single-Threaded WAL Pipelining:** While Group Commits coalesce concurrent multi-threaded writes, single-threaded sequential write streams would otherwise eat 2 FUA flushes per write call. To mitigate this latency for single-threaded bulk writes, `dnpfs.ko` implements **Pipelined WAL Batching**: consecutive Phase 3 dry-run manifests within a single open file stream are batched into a single WAL FUA write, reducing synchronization overhead to 1 FUA flush per batch during active sequential streams.
 * **The Structure Path (Asynchronous Checkpoints):** Structural filesystem updates (in-place inode tables, free block bitmaps, and checksum tables) are updated in RAM first. These are lazily written to the metadata device asynchronously during idle periods (checkpointing), amortizing flash wear.
 
 The detailed transactional sequence is:
