@@ -455,7 +455,13 @@ To prevent active readers from experiencing read blocks or downtime during a slo
     * `read()` / `open(O_RDONLY)`: In blocking mode (default), the read call blocks (putting the thread to sleep in a commit wait-queue) until the transaction completes and the flag is cleared. In non-blocking mode (`O_NONBLOCK`), the call returns `EAGAIN` or `EBUSY` immediately.
     * `write()` / `open(O_WRONLY)`: The initial write worker executes the write; concurrent write requests from other processes return `EBUSY`.
   * `rename()`: **Allowed.** Modifying directory names updates only the SSD directory pointer to the inode's fixed `inode_id`. Write transactions are tracked by `inode_id`, keeping block copies completely unaffected by path renames.
-  * `unlink()`: **Allowed.** Removes the directory entry pointing to the `inode_id`, aborts the copy transaction immediately, and releases all reserved data blocks.
+  * `unlink()`: **Allowed (Ordered Abort Sequence):**
+    1. **Untrack:** The driver immediately removes the file's directory entry on the SSD, hiding it from userspace.
+    2. **Abort Signal:** Sets an `ABORT_PENDING` flag on the active transaction.
+    3. **Worker Stop:** The write worker checks the flag at its next block write-and-verify boundary, stops sequential writing, and cleans up its VFS structures.
+    4. **Release Reservations:** Once the worker has safely terminated, the driver releases the blocks back to the free block bitmap, preventing block reuse concurrency races.
+    5. **Reader Wakeup:** Wakes any readers sleeping on the transaction's commit wait-queue, immediately returning `ENOENT`.
+    6. **POSIX-compliant In-Flight Reads:** If a reader is actively streaming via Live-Migration fallback when `unlink()` occurs, the driver keeps the internal source file descriptor open and continues serving reads from the original source file until the user closes the local file handle.
 * **Atomic Promotion:** Once the copy completes and passes checksum validation, the driver atomically clears the `INODE_PENDING_COMMIT` flag and the `fallback_path_offset` field, promoting the file to a standard local DNPFS inode. If a move was requested, the source file deletion is then safely triggered.
 
 ---
