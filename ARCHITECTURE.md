@@ -110,7 +110,7 @@ FAT32 uses 32-bit fields for file size — a design decision made in the 1980s w
 
 Both devices are identified by **UUID only** — never by `/dev/sdX` names, which can change across reboots. The driver enforces pairing at mount time by verifying UUIDs stored in both device headers. To prevent the data device from appearing as completely blank/unformatted raw space to OS tools (which could lead to accidental partitioning or formatting), the data device contains a minimal 512-byte **DNPFS Data Signature Header** at Sector 0. This header stores the data device's own UUID and its paired metadata device's UUID, allowing `blkid` and `udev` to identify it. To protect against bad sectors on Sector 0, a **Backup Data Signature Header** is written to the last sector of the data device.
 
-To protect against metadata corruption, the metadata device maintains **Redundant Superblocks** at fixed offsets (e.g., primary at `0x1000`, with backups at block offsets 1024, 8192, and 32768).
+To protect against metadata corruption, the metadata device maintains **Redundant Superblocks** at fixed offsets (primary at `0x1000`, with backups at block offsets 1024, 8192, and 32768). **Bitmap Reservation Invariant:** Block offsets 0, 1024, 8192, and 32768 on `DNPFS_META` are permanently marked as allocated/reserved in the metadata block bitmap during `dnpfs-format`, excluding them from all dynamic allocation pools and preventing inadvertent overwrite by dynamic metadata expansion.
 
 ### Self-Contained Offline Driver Distribution Partition (`DNPFS_BOOTSTRAP`)
 
@@ -122,6 +122,7 @@ To simplify offline deployment across Linux hosts that lack pre-installed DNPFS 
    - **Zero-Download Offline Mounting (Linux):** On Linux hosts, users can mount the DNPFS volume offline without needing an active internet connection to fetch driver packages. Execution of mount scripts requires explicit user invocation (`./dnpfs-mount.sh`), adhering to Linux security standards without relying on untrusted auto-execution.
 2. **Partition 2: `DNPFS_META` (Remaining SSD Capacity):**
    - Houses the raw DNPFS metadata structures (Superblock, Transaction Region, Tagged-Union Inode Table, Level 1 & 2 Checksum Maps, Bad Block Maps).
+   - **Partition-Scoped Kernel Claims:** When `dnpfs.ko` mounts the volume, exclusive kernel locks (`bd_holder`) are claimed **strictly on Partition 2 (`DNPFS_META`, e.g. `/dev/nvme0n1p2`)** and the data partition (`DNPFS_DATA`, e.g. `/dev/sdb1`), rather than claiming the raw whole-disk device node (`/dev/nvme0n1`). This guarantees that Partition 1 (`DNPFS_BOOTSTRAP`) remains fully accessible and mounted by the host OS without file locking collisions. Parent disk partition tables are protected against re-partitioning via standard `udev` rules matching DNPFS partition signatures.
 
 ### Metadata Sizing Ratio Derivation (1.0% – 1.5%)
 
@@ -178,7 +179,7 @@ DNPFS does not store a global dirty flag or active transaction counter in the su
 
 *Note on On-Disk Feature Flags:* Feature bitmasks (`compat_flags`, `incompat_flags`, `ro_compat_flags`) enable forward and backward format extensibility without requiring full format version bumps. Unrecognized `incompat_flags` cause `dnpfs.ko` to safely refuse mounting, while unrecognized `ro_compat_flags` force a read-only mount posture.
 
-*Note on Transaction Region Storage Model & Spillover Blocks (Bootstrapping & Variable Length Solution):* The `/transactions/` path referenced in manifests is a virtual representation presented by userspace tools (`dnpfsd`, `dnpfs-dry`). Physically on disk, transactions are stored in a dedicated, pre-allocated **Transaction Region** (`transaction_region_offset` in the superblock). Manifests are written into 1 KB raw header slots in this metadata ring buffer. Each 1 KB slot holds the manifest header and up to 32 inline extents. If a pathologically fragmented COW file requires more than 32 extents, the extra extent records spill over into chained **Transaction Spillover Metadata Blocks** pre-allocated on the metadata SSD. If the transaction ring buffer is completely filled with active pending transactions, new write allocation attempts block cleanly on a transaction wait-queue or return `ENOSPC` (active manifest slots are never evicted). This completely eliminates any bootstrapping paradox during boot-time crash recovery while safely supporting arbitrarily long extent maps.
+*Note on Transaction Region Storage Model & Spillover Blocks (Bootstrapping & Variable Length Solution):* The `/transactions/` path referenced in manifests is a virtual representation presented by userspace tools (`dnpfsd`, `dnpfs-dry`). Physically on disk, transactions are stored in a dedicated, pre-allocated **Transaction Region** (`transaction_region_offset` in the superblock). Manifests are written into 1 KB raw header slots in this metadata ring buffer. Each 1 KB slot holds the manifest header and up to 32 inline extents. If a pathologically fragmented COW file requires more than 32 extents, the extra extent records spill over into chained **Transaction Spillover Metadata Blocks** pre-allocated on the metadata SSD. **Spillover Chain Integrity:** Every spillover block contains an explicit header structure holding a `chain_checksum` (xxHash3_64 over block payload) and a monotonically increasing `chain_sequence_id`. During boot-time crash recovery, the recovery manager validates the entire chain's sequence and checksums before evaluating extents, preventing partial/corrupt manifest parsing. If the transaction ring buffer is completely filled with active pending transactions, new write allocation attempts block cleanly on a transaction wait-queue or return `ENOSPC` (active manifest slots are never evicted). This completely eliminates any bootstrapping paradox during boot-time crash recovery while safely supporting arbitrarily long extent maps.
 
 *Note on Growable Limits:* Like the inode table, the reservation table is **dynamically growable**. The `reservation_table_offset` points to a head block. As concurrent transactions increase, the driver allocates new metadata blocks dynamically (chained via `next_block` pointers), eliminating arbitrary bounds on transaction concurrency.
 
@@ -309,6 +310,11 @@ In V1, whenever a Copy-On-Write write, file deletion, or Branch 1 bad-sector blo
 Level 2 group checksums use a fixed **positional formula** over 100-block spans (e.g. Group 0 covers blocks 0 to 99). When blocks within a group are freed (via COW or file deletion), their corresponding Level 1 block checksum entry in the metadata SSD checksum table is set to `0x0000000000000000` (status = `free`). The Level 2 group hash is computed as:
 $$\text{Group\_Checksum} = \text{xxHash3\_64}([\text{checksum}_0, \text{checksum}_1, \dots, \text{checksum}_{99}])$$
 Freed block slots contribute `0x0` as a deterministic 64-bit value in the positional array. This guarantees that group hashes remain 100% deterministic after block deletions, preventing false-positive scrubbing alarms without requiring dynamic array resizing.
+
+**Level 2 Group Parity (Optional 1-Block Bit Rot Self-Healing):**
+To eliminate unrecoverable data loss from single-sector bit rot without requiring full drive mirroring, DNPFS supports an optional **Level 2 Group Parity Block** stored on the metadata SSD. For every 100-block group, `dnpfs.ko` maintains a 4 KB XOR parity block calculated across all active member data blocks:
+$$\text{Parity\_Block} = B_0 \oplus B_1 \oplus \dots \oplus B_{99}$$
+When background scrubbing or a file read detects a checksum mismatch on a single block $B_k$ (where Level 1 checksum verification pinpoints the corrupted block), `dnpfs.ko` reconstructs $B_k$ in RAM using the group parity block and remaining healthy blocks ($B_k = \text{Parity} \oplus \sum_{i \neq k} B_i$). The reconstructed block is written to a clean data sector, bad sector maps are updated, and the read succeeds transparently without returning `EIO`.
 
 **Routine health check flow (Data Verification / Scrubbing):**
 
@@ -467,7 +473,7 @@ Unlike userspace leases, reservations in DNPFS are held strictly in RAM by the k
 * **Process Kills / Crashes (`SIGKILL`, OOM, abnormal exit):** If the writing process is killed or terminates prematurely while the OS kernel remains running, Linux VFS triggers standard file handle release callbacks (`f_op->release` / `f_op->flush`). The `dnpfs.ko` driver intercepts this callback, issues an **automatic transaction abort signal**, releases all held RAM reservations back to the free block bitmap, and deletes the pending manifest from `/transactions/`.
 * **Kernel Worker Deadlock / System Crash:** If an unrecoverable kernel thread deadlock or full OS crash occurs, the reservation remains held until the system reboots, at which point the boot-time recovery loop scans `/transactions/` and safely rolls back the interrupted transaction.
 * **Uninterruptible D-State Processes & Admin Override:** If a writing process gets stuck in an uninterruptible sleep state (D-state) due to physical I/O errors on a dying data HDD (preventing standard release callbacks from firing), system administrators can forcefully abort the transaction using the `dnpfs-dry --force-abort <transaction_id>` utility. This issues an explicit driver IOCTL (`DNPFS_IOC_ABORT_TRANSACTION`, requiring `CAP_SYS_ADMIN`), which forcefully revokes held RAM reservations, purges the manifest from `/transactions/`, and wakes up any blocked reader/writer threads with `EINTR`. *(Note on D-State Threads: Force-abort revokes the filesystem reservations and unblocks other processes waiting on the inode; the original stuck D-state thread itself remains blocked in the kernel block layer until the physical disk I/O completes or times out).*
-* **Automated Deadman's Switch (Unattended Escalation, Block Quarantine & Reclamation CLI):** For headless NAS environments operating without a human administrator, `dnpfs.ko` implements an **Automated Deadman's Switch**. If an active transaction experiences zero physical I/O progress for longer than a configurable deadman threshold (default: 10 minutes), the kernel coordinator automatically marks the transaction `SUSPENDED_DEADMAN`, unblocks waiting threads with `ETIMEDOUT`/`EIO`, and logs a critical emergency alert to `syslog`/`dnpfsd`. **Critical Safety Rule:** To prevent double-allocation write corruption from zombie I/O landing late on reused sectors, the Deadman's Switch **never releases or reclaims target data blocks into the free allocation bitmap**. Instead, the target block range is transitioned to a locked `QUARANTINED_DEADMAN` state, keeping the blocks strictly immune to re-allocation until either: (1) the underlying D-state thread physically resolves in the kernel block layer, or (2) an administrator explicitly purges the quarantine using `dnpfs-dry --clear-quarantine <transaction_id>` (requiring `CAP_SYS_ADMIN`) after confirming hardware replacement. `dnpfsd` issues a persistent console warning if quarantined blocks exceed 5% of volume capacity or remain locked for >24 hours.
+* **Automated Deadman's Switch (Unattended Escalation, Block Quarantine & Reclamation CLI):** For headless NAS environments operating without a human administrator, `dnpfs.ko` implements an **Automated Deadman's Switch**. If an active transaction experiences zero physical I/O progress for longer than a configurable deadman threshold (default: 10 minutes), the kernel coordinator automatically marks the transaction `SUSPENDED_DEADMAN`, unblocks waiting threads with `ETIMEDOUT`/`EIO`, and logs a critical emergency alert to `syslog`/`dnpfsd`. **Critical Safety Rule:** To prevent double-allocation write corruption from zombie I/O landing late on reused sectors, the Deadman's Switch **never releases or reclaims target data blocks into the free allocation bitmap**. Instead, the target block range is transitioned to a locked `QUARANTINED_DEADMAN` state, keeping the blocks strictly immune to re-allocation until either: (1) the underlying D-state thread physically resolves in the kernel block layer, or (2) an administrator explicitly purges the quarantine using `dnpfs-dry --clear-quarantine <transaction_id>` (requiring `CAP_SYS_ADMIN`). **Quarantine Clearance Hardware Safety:** Before clearing quarantined sectors, `dnpfs.ko` issues a mandatory hardware block device flush (`blkdev_issue_flush`) and verifies that no pending request handles remain in the controller queue, guaranteeing that late-arriving hardware writes cannot land on re-allocated sectors. `dnpfsd` issues a persistent console warning if quarantined blocks exceed 5% of volume capacity or remain locked for >24 hours.
 
 ---
 
@@ -497,11 +503,12 @@ PHASE 3: RESERVATION
   Suppress TRIM on reserved blocks
 
 PHASE 4: EXECUTION
-  Write data blocks to data device first
-  After each block: read back and verify checksum (or dirty-page verify for RAM safety)
-  On checksum mismatch: flag bad sector, find alternative, retry
-  Write metadata second (inode updates, directory entries)
-  Flush meta device
+  Write data blocks to data device sequentially
+  Verify in-RAM dirty-page checksum right before disk controller submission (prevents RAM corruption)
+  Optional (verify=full_readback): Read back written block from disk and verify checksum (disabled by default on HDDs to preserve 150+ MB/s sequential performance)
+  On checksum mismatch: flag bad sector, allocate alternative block, retry write
+  Write metadata second (inode updates, directory entries) to metadata SSD WAL
+  Flush meta device (FUA)
 
 PHASE 5: CONFIRMATION
   Cross-reference written blocks against allocation.dry
@@ -547,7 +554,7 @@ To eliminate data loss risks from partial or interrupted moves, direct metadata-
 <!--
 To prevent active readers from experiencing read blocks or downtime during a slow copy/move operation, DNPFS implements a metadata-level **Live-Migration Symlink Fallback** redirection:
 * **Pending Commit Flag:** When a write/copy begins, the inode is created immediately on the metadata device with the `INODE_PENDING_COMMIT` flag set in its `flags` field.
-* **Encapsulated Redirection:** The `fallback_path_offset` field in the inode points to the file path of the original source file on the host OS. This path is stored internally in the metadata table and is **never** exposed to userspace as a literal symlink (e.g., `readlink()` and `ls -l` will report the file as a normal regular file with its eventual size). To bypass mount namespace visibility issues (such as containers), the driver opens the source file once during Phase 1 (Planning) using the initiator's namespace/credentials, obtaining an active kernel `struct file *` reference stored in RAM. The fallback read path directly invokes `kernel_read` on this file reference. To ensure kernel safety, this `struct file *` reference is owned and managed strictly by the global driver superblock context in RAM, not the initiating process. If the initiating process terminates, the file reference is kept alive by the global driver coordinator and is only released (`fput`) when the copy transaction either commits or aborts.
+* **Encapsulated Redirection & Explicit Status Reporting:** The `fallback_path_offset` field in the inode points to the file path of the original source file on the host OS. In accordance with **"Explicit Over Implicit"**, the inode explicitly sets the `INODE_MIGRATING` status flag and exposes its active fallback path via extended attribute (`user.dnpfs.migration_source`) and `dnpfs-dry --inspect`. Standard POSIX syscalls (`read()`) perform zero-copy redirection to the internal `struct file *` reference owned by the driver, while administrative tools clearly report the active migration state.
 * **TOCTOU Permission Validation:** To prevent Time-Of-Check to Time-Of-Use privilege escalation via the fallback handle, the driver **does not** bypass credentials during reads. Every time a process invokes a `read()` on the pending inode, the driver calls the standard `inode_permission(pending_destination_inode, MAY_READ)` helper to validate the *current calling process's credentials* against the **destination file's own requested permissions** (not the stale permissions of the original source file). If the caller lacks read access, the syscall returns `EACCES` or `EPERM`. Only after the check succeeds does the driver delegate the read to the internal `struct file *` reference.
 * **Source Mutation Protection:** During Phase 1 (Planning), the driver records the source file's `mtime`, `size`, and `inode_id` in the `allocation_<write_id>.dry` manifest. Every intercepted read request validates that the source file's current attributes match these records. If a mismatch is detected:
   * The read fails with `ESTALE` (Stale file handle) or `EIO`.
@@ -615,6 +622,7 @@ Because kernel space (`dnpfs.ko`) cannot directly render interactive desktop or 
 3. **Userspace Prompting:** The background daemon `dnpfsd` listens on the Netlink socket. If an active desktop or terminal session is present, `dnpfsd` spawns a desktop notification or CLI prompt (`dnpfs-dry --prompt`).
 4. **Strict IOCTL Authorization & Per-Volume Scoping:** When the operator selects a decision (A/B/C), `dnpfsd` passes the choice back to `dnpfs.ko` via `DNPFS_IOC_RESOLVE_OFFLINE_EVENT`. The kernel driver strictly enforces `capable(CAP_SYS_ADMIN)` **AND** verifies that the calling process owns an active file descriptor pointing to the target volume's mount point, ensuring per-volume isolation.
 5. If no response occurs within 30 seconds (or on headless servers without `dnpfsd`), `dnpfs.ko` automatically executes **Option C (Halt and Preserve Current State)**.
+6. **Subsystem Precedence Rule (Netlink Offline Handler vs. Deadman Switch):** When a physical device disconnection occurs, both the Netlink Offline handler and the Deadman Switch could potentially trigger. DNPFS enforces strict precedence: **Device Offline detection (`DNPFS_NL_EVT_OFFLINE`) overrides the Deadman Switch**. Upon detecting an offline block device, `dnpfs.ko` immediately **pauses** the Deadman Switch timer for all active transactions on that volume. If no user response arrives within 30 seconds, `dnpfs.ko` executes Option C (Halt and Preserve Current State), holding reservations until reconnection or reboot. The Deadman Switch operates strictly when devices remain physically online but experience zero I/O progress due to internal controller hangs or D-state kernel stalls.
 
 **On power loss detection (boot-time):**
 
@@ -756,15 +764,22 @@ Checksum mismatch detected during Phase 4 read-back verify:
   → Escalate warning if S.M.A.R.T. pending sector count is rising
 ```
 
-**Branch 2 — Read-Time Fault (At-Rest Silent Corruption / Bit Rot):**
+**Branch 2 — Read-Time Fault (At-Rest Silent Corruption / Bit Rot & Parity Self-Healing):**
 ```
 Checksum mismatch detected during file read or background scrubbing:
   → Source buffer is NOT in RAM; data on disk is corrupted
-  → Add sector/block X to bad_block_map on metadata device (status=bad)
-  → Mark affected extent/inode as DAMAGED in metadata
-  → Return EIO (I/O Error) to calling process
-  → Log critical bit-rot alert with filename, offset, and block ID
-  → Note: Automatic recovery is impossible without an external backup or secondary mirror
+  → Level 2 Group Parity enabled?
+      → YES: Read remaining 99 healthy blocks & Group Parity Block from SSD
+             Reconstruct corrupted block in RAM via XOR: B_k = Parity XOR (sum B_i)
+             Verify reconstructed block xxHash3 checksum
+             Write reconstructed block to new clean data sector
+             Update bad_block_map on metadata SSD (flag old sector bad, map to new sector)
+             Serve read successfully (Self-Healing complete!)
+      → NO (or multi-block group failure):
+             Add sector/block X to bad_block_map on metadata device (status=bad)
+             Mark affected extent/inode as DAMAGED in metadata
+             Return EIO (I/O Error) to calling process
+             Log critical bit-rot alert with filename, offset, and block ID
 ```
 
 **Bad Block Map Sizing & Thresholds:**
@@ -976,6 +991,7 @@ Multiple processes may attempt operations simultaneously. DNPFS handles this wit
 - **Multiple Allocation Manifests:** Rather than a single global file, each active transaction utilizes a dedicated `allocation_<write_id>.dry` manifest. This reduces write contention and allows independent operations to proceed concurrently.
 - Two operations may not hold overlapping block reservations.
 - Reservations are granted in order of request.
+- **Strict Ascending Extent Locking Invariant (Deadlock Elimination):** To prevent AB-BA circular wait deadlocks in kernel space when concurrent operations request multi-extent block reservations, all transactions **must sort their requested block extents by strictly ascending starting sector address** prior to submitting reservation requests to the kernel coordinator.
 - **Starvation Prevention & Priority Aging:** To prevent long-running reservations from starving smaller overlapping write requests indefinitely, the reservation coordinator implements **Priority Aging**. Reservation waiters accumulate priority based on wait duration ($\text{priority} = \text{wait\_time\_ms} \times \text{weight}$). If a waiter's target block range overlaps a long-held reservation and waits longer than 5,000 ms, the coordinator elevates its priority to `RANGE_PRIORITY_INHERITANCE`, pausing new allocation requests **strictly for transactions whose requested block range overlaps the contended span**. Unrelated non-overlapping transactions across the volume continue to allocate and execute in parallel without any global system stall.
 - A new dry run that would require blocks already reserved must wait or fail with a retry signal.
 - Directory entry locks are held for the duration of any operation that modifies directory structure.
