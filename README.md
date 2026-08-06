@@ -23,31 +23,31 @@ DNPFS eliminates that entirely.
 
 ## Key Features
 
-**Dry run before every write.** Every operation is simulated first. An `allocation.dry` manifest is generated and committed before anything touches either device. You know exactly where data will land before it lands there.
+**Dry run before every write.** Every operation is simulated first. An `allocation.dry` manifest (binary `struct` on disk, rendered as YAML by userspace tools) is generated and committed before anything touches either device. You know exactly where data will land before it lands there.
 
-**Block reservation with lease renewal.** Target extents are leased during an operation so nothing else can overwrite them. Expiry is calculated dynamically based on the estimated write time, and active long-running writes renew their lease using a heartbeat mechanism. If aborted, reservations expire automatically to prevent ghost block pileups.
+**Kernel-managed block reservation.** Target extents are reserved during an operation so nothing else can overwrite them. Reservations are held in RAM strictly by the kernel's transaction coordinator for the duration of the write and do not expire based on wall-clock time, eliminating mid-runtime double-allocation races. On crash recovery, dangling reservations from interrupted writes are automatically released.
 
 **Forensic recovery manifest.** If a write is interrupted by power loss or disconnection, the manifest tells you exactly which blocks were written and which were not. Recovery is precise, not a guess.
 
-**Transactional isolation via Inode flags.** Files being written/copied are immediately visible in the directory structure but carry the `INODE_PENDING_COMMIT` flag. Any concurrent read requests to these files are either transparently redirected (using the Live-Migration Symlink Fallback) or blocked, preventing processes from reading stale/unwritten disk blocks.
+**Transactional isolation via Inode flags.** Files being written/copied are immediately visible in the directory structure but carry the `INODE_PENDING_COMMIT` flag. Any concurrent read or write requests to pending files block (or return `EBUSY` if `O_NONBLOCK` is set) until the transaction commits, preventing access to unwritten or partial disk blocks. *(Live-Migration Symlink Fallback is planned for V2).*
 
-**Two-level deferred checksumming.** At copy/write time, blocks are grouped (dynamic sizing based on file size) to write a single group checksum, minimizing write latency and SSD wear. Individual file/block xxHash3 checksums are generated in the background when the drive is idle. Routine integrity checks verify group checksums first, dropping to individual checksums only to pinpoint corruption.
+**Two-level Merkle checksumming.** At write time, data blocks are verified using 64-bit xxHash3 checksums with a static 100-block group layout stored on the metadata device. Routine integrity checks verify group checksums first, dropping to individual block checksums only to pinpoint corruption. *(Dynamic size-based grouping and deferred checksumming are planned for V2).*
 
-**Accidental format protection.** When mounted, DNPFS opens the data device exclusively (`O_EXCL`), causing formatting and partitioning utilities (`mkfs`, `fdisk`) to fail with a write-protect/busy error. This is coupled with a minimal Data Signature Header on Sector 0 (and backed up on the last sector) so standard tools identify it as DNPFS.
+**Accidental format protection.** While mounted, DNPFS opens the data device exclusively (`O_EXCL`), causing formatting utilities (`mkfs`, `fdisk`) to fail with a device-busy error. When unmounted, a Sector 0 Data Signature Header provides advisory identification for `blkid` and `wipefs`.
 
-**Bad sector tracking.** A bad block map lives on the metadata drive. Bad sectors on the data drive are detected, logged, and permanently avoided. The data drive's dying state is tracked in detail — even as it degrades.
+**Bad sector tracking.** A bad block map lives on the metadata drive. Bad sectors detected during write verification or read scrubbing are logged and permanently avoided. Write failures dynamically allocate alternate blocks; read-time at-rest corruption triggers bad-block logging and reports `EIO`.
 
 **S.M.A.R.T. integration.** Both drives are monitored continuously. Rising remap counts, pending sectors, uncorrectable errors — all surfaced with recommended actions before data loss occurs.
 
 **Metadata backup system.** The metadata drive can be imaged completely. Backups are triggered automatically on large operations, on S.M.A.R.T. warnings, or on a schedule. If the metadata drive dies, restore from backup to a new drive and continue.
 
-**Encryption via LUKS.** Four modes: encrypt the metadata device only (recommended default), encrypt the data device only, encrypt both, or no encryption. Mode 3 uses a single passphrase that unlocks both devices in sequence — one unlock, full protection.
+**Block-layer Encryption via LUKS.** Encryption is applied at the standard Linux block layer (`dm-crypt`/LUKS) beneath DNPFS. Devices are unlocked via standard OS utilities (`cryptsetup`) prior to mounting. *(Native driver-managed key chaining is planned for V2).*
 
 **RAID compatible.** DNPFS works on top of any mdadm or dm-raid array transparently. RAID 1 on the metadata device is strongly recommended for high-availability setups and eliminates the metadata single point of failure entirely.
 
 **Copy-On-Write (COW) modifications.** To maintain strict transactional safety, random writes (`pwrite`) and truncations (`ftruncate`) use Copy-On-Write rather than in-place block updates. Edits allocate new block extents, keeping the old data intact until the write successfully verifies and commits.
 
-**Unified transaction model.** Writes, deletes, copies, and renames all follow the same lifecycle: plan → dry run → reserve → execute → verify → confirm. Every operation is recoverable at every stage. Direct cross-device moves are banned and replaced by a secure Copy-Verify-Delete pipeline, featuring a Live-Migration Symlink Fallback to guarantee zero-downtime read redirection during copying. Because writes are tracked by fixed `inode_id` mappings rather than file paths, pending copies can be renamed or deleted (aborting the transaction) on the fly without disrupting the active copy worker. Non-conflicting writes execute in parallel, and metadata commits are coalesced via **Group Commits** on the metadata SSD.
+**Unified transaction model.** Writes, deletes, copies, and renames all follow the same lifecycle: plan → dry run → reserve → execute → verify → confirm. Every operation is recoverable at every stage. Direct cross-device moves are banned and replaced by a secure Copy-Verify-Delete pipeline. Because writes are tracked by fixed `inode_id` mappings rather than file paths, pending copies can be renamed or deleted (aborting the transaction) on the fly without disrupting the active copy worker. Non-conflicting writes execute in parallel, and metadata commits are coalesced via **Group Commits** on the metadata SSD.
 
 > [!IMPORTANT]
 > **Contributor Invariant:** The source file deletion phase **must never** execute in parallel with the copy phase or before verification has fully succeeded. Any attempts to "optimize" this by running copy and delete operations concurrently are strictly prohibited. This is a core architectural decision for data safety and must not be changed.

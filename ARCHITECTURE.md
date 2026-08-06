@@ -318,7 +318,9 @@ To protect against random DRAM corruption (e.g., from cosmic rays or faulty non-
 
 The `allocation.dry` file is the cornerstone of DNPFS crash recovery and write verification. It is generated during the dry run phase of every write or delete operation and committed to the meta device before any actual operation begins.
 
-### Format
+*Note on Binary vs. YAML Representation:* On disk and in kernel memory, `allocation_*.dry` files are serialized as compact C binary structures (`struct dnpfs_allocation_manifest`) by `dnpfs.ko` to maximize hot-path write throughput without kernel-level text parsing overhead. Userspace tools (`dnpfsd`, `dnpfs-dry`) parse these binary manifests and render them as human-readable YAML for administrative inspection.
+
+### Structure (YAML Representation)
 
 ```yaml
 manifest_version: 1
@@ -614,29 +616,28 @@ This guarantees that the logged intent on the metadata device always leads the d
 
 ### Detection
 
-The `dirty_flag` in the superblock is set on mount and cleared only on clean unmount. A set dirty_flag on boot is the primary crash signal — no expensive full-disk scan is needed.
+Crash recovery is triggered on mount if the `/transactions/` directory on the metadata device contains any uncommitted `allocation_*.dry` manifests.
 
-### Recovery Procedure
+### Recovery Procedure (Concurrent Multi-Transaction Loop)
 
 ```
 Boot
 → Read superblock from meta device
-→ dirty_flag set?
+→ Scan metadata device /transactions/ directory for uncommitted allocation_*.dry manifests
+→ Uncommitted manifests exist?
   → Yes: enter recovery mode
-    → Read journal: find last confirmed checkpoint
-    → Find allocation.dry for interrupted operation
-    → For each block in manifest:
-        Read block from data device
-        Compute checksum
-        Compare to expected_checksum in manifest
-        → Match: block was written successfully
-        → No match or read error: block was not written or is corrupt
-    → Determine operation completeness:
-        All blocks match → confirm operation, update inode, clear dirty_flag
-        Some match → partial write detected:
-            Option A: roll back to pre-op snapshot (safe, loses the partial write)
-            Option B: mark partial completion, report to user for manual decision
-        None match → operation never started, discard manifest, clear dirty_flag
+    → For EACH uncommitted manifest (allocation_<write_id>.dry):
+        → Read manifest from /transactions/
+        → For each block in manifest's extent map:
+            Read block from data device
+            Compute xxHash3 checksum in RAM
+            Compare to expected_checksum in manifest
+            → Match: block was written successfully
+            → No match or read error: block was not written or is corrupt
+        → Determine operation completeness:
+            All blocks match → confirm operation, promote inode to committed
+            Partial or no match → roll back metadata to pre_operation_snapshot, discard transaction
+        → Delete manifest file (allocation_<write_id>.dry) from /transactions/
   → No: clean mount, proceed normally
 ```
 
@@ -658,16 +659,30 @@ Every data block written to the data device has a corresponding xxHash3/CRC32C c
 
 ### Bad Sector Handling
 
+DNPFS strictly distinguishes between **Write-Time Faults** (recoverable via active RAM buffers) and **Read-Time At-Rest Faults** (unrecoverable silent corruption on disk):
+
+**Branch 1 — Write-Time Fault (Verification Mismatch during Write):**
 ```
-Checksum mismatch detected on block X:
-  → Add block X to bad_block_map with status=bad
-  → Attempt to find alternative block Y (not in bad_block_map, not reserved)
-  → Rewrite data to block Y
-  → Verify block Y checksum
-  → Update inode block pointer from X to Y
-  → Mark block X in allocation bitmap as permanently unavailable
-  → Log event with timestamp and detection method
-  → If S.M.A.R.T. pending sector count rising: escalate warning to user
+Checksum mismatch detected during Phase 4 read-back verify:
+  → Source buffer is still present in RAM
+  → Add sector/block X to bad_block_map on metadata device (status=bad)
+  → Allocate clean alternative block Y (not in bad_block_map, not reserved)
+  → Write RAM buffer to block Y
+  → Verify block Y xxHash3 checksum
+  → Update destination extent map in allocation.dry manifest from X to Y
+  → Log bad sector event with timestamp
+  → Escalate warning if S.M.A.R.T. pending sector count is rising
+```
+
+**Branch 2 — Read-Time Fault (At-Rest Silent Corruption / Bit Rot):**
+```
+Checksum mismatch detected during file read or background scrubbing:
+  → Source buffer is NOT in RAM; data on disk is corrupted
+  → Add sector/block X to bad_block_map on metadata device (status=bad)
+  → Mark affected extent/inode as DAMAGED in metadata
+  → Return EIO (I/O Error) to calling process
+  → Log critical bit-rot alert with filename, offset, and block ID
+  → Note: Automatic recovery is impossible without an external backup or secondary mirror
 ```
 
 ### allocation.dry Integration
@@ -970,11 +985,11 @@ These are real constraints users should understand before adopting DNPFS. They a
 
 These are fundamental constraints that cannot be engineered away, only mitigated.
 
-### Metadata/Data Time-Gap Recovery
+### Metadata/Data Time-Gap & Split-Brain Risk
 
-Two physically separate devices cannot achieve native hardware-level atomic synchronization during a crash. There exists a microsecond gap between the metadata device confirmation and the data device write where power loss can occur. 
+Two physically separate devices cannot achieve native hardware-level atomic synchronization during a crash. There exists a microsecond gap between the metadata device confirmation and the data device write where power loss can occur, introducing a structural **split-brain risk** where the metadata device and data device disagree on state.
 
-DNPFS resolves this by defining strict write-ordering boundaries using WAL transactions. If power is lost during this time-gap, recovery is fully deterministic: the boot-time recovery manager reads the active manifests and replays or rolls back the metadata to match the physical blocks actually written on the data drive, preventing any silent metadata-data mismatches.
+DNPFS resolves this by defining strict write-ordering boundaries using WAL transactions. If power is lost during this time-gap, recovery is fully deterministic: the boot-time recovery manager scans `/transactions/` for active manifests and replays or rolls back the metadata to match the physical blocks actually written on the data drive, eliminating split-brain desynchronization.
 
 ### Drive Firmware Lies
 
