@@ -59,6 +59,17 @@ DNPFS is **not** designed for OS installation. It is a storage filesystem for la
 
 **Explicit over implicit.** Write ordering, flush guarantees, TRIM suppression, and cache coordination are all explicit driver responsibilities — never assumed from the underlying hardware.
 
+### Build vs. Compose Architectural Justification
+
+A critical senior architectural question is: *Why build a custom on-disk format and VFS driver instead of stacking existing Linux kernel building blocks (such as `dm-integrity` + `ext4 -J` external journal + `bcache` + `smartd`)?*
+
+DNPFS requires a unified, filesystem-native design rather than a stacked block-layer composition due to four fundamental architectural constraints:
+
+1. **Lack of File-Level Semantic Awareness in Block Layers:** Block-level integrity layers like `dm-integrity` operate strictly on raw sector numbers without knowledge of VFS inodes, filenames, or extents. They cannot perform per-file dry-run simulation manifests (`allocation.dry`), file-level extent defragmentation, or forensic file recovery (`dnpfs-recover`).
+2. **Multi-Layer I/O Mapping & Failure Latency:** Stacking four separate subsystem layers (`dm-integrity` → `bcache` → `ext4` → `smartd`) introduces multi-tier mapping overhead and independent failure modes. A failure in `dm-integrity` returns a generic I/O error to `ext4`, depriving the OS of dry-run transaction context needed for precise rollback.
+3. **Transactional Pre-Allocation & TRIM Coordination:** Generic filesystems cannot coordinate TRIM suppression across a separate SSD WAL and data HDD while holding indefinite in-RAM transaction reservations prior to physical execution.
+4. **Unified Forensic Recovery:** DNPFS's `allocation.dry` manifests allow exact offline reconstruction of partially written files after power loss — a capability that cannot be achieved by stacking block-layer caches under generic filesystems.
+
 ---
 
 ## Storage Limits
@@ -466,7 +477,7 @@ Unlike userspace leases, reservations in DNPFS are held strictly in RAM by the k
 * **Process Kills / Crashes (`SIGKILL`, OOM, abnormal exit):** If the writing process is killed or terminates prematurely while the OS kernel remains running, Linux VFS triggers standard file handle release callbacks (`f_op->release` / `f_op->flush`). The `dnpfs.ko` driver intercepts this callback, issues an **automatic transaction abort signal**, releases all held RAM reservations back to the free block bitmap, and deletes the pending manifest from `/transactions/`.
 * **Kernel Worker Deadlock / System Crash:** If an unrecoverable kernel thread deadlock or full OS crash occurs, the reservation remains held until the system reboots, at which point the boot-time recovery loop scans `/transactions/` and safely rolls back the interrupted transaction.
 * **Uninterruptible D-State Processes & Admin Override:** If a writing process gets stuck in an uninterruptible sleep state (D-state) due to physical I/O errors on a dying data HDD (preventing standard release callbacks from firing), system administrators can forcefully abort the transaction using the `dnpfs-dry --force-abort <transaction_id>` utility. This issues an explicit driver IOCTL (`DNPFS_IOC_ABORT_TRANSACTION`, requiring `CAP_SYS_ADMIN`), which forcefully revokes held RAM reservations, purges the manifest from `/transactions/`, and wakes up any blocked reader/writer threads with `EINTR`. *(Note on D-State Threads: Force-abort revokes the filesystem reservations and unblocks other processes waiting on the inode; the original stuck D-state thread itself remains blocked in the kernel block layer until the physical disk I/O completes or times out).*
-* **Automated Deadman's Switch (Unattended Escalation, Block Quarantine & Reclamation CLI):** For headless NAS environments operating without a human administrator, `dnpfs.ko` implements an **Automated Deadman's Switch**. If an active transaction experiences zero physical I/O progress for longer than a configurable deadman threshold (default: 10 minutes), the kernel coordinator automatically marks the transaction `SUSPENDED_DEADMAN`, unblocks waiting threads with `ETIMEDOUT`/`EIO`, and logs a critical emergency alert to `syslog`/`dnpfsd`. **Critical Safety Rule:** To prevent double-allocation write corruption from zombie I/O landing late on reused sectors, the Deadman's Switch **never releases or reclaims target data blocks into the free allocation bitmap**. Instead, the target block range is transitioned to a locked `QUARANTINED_DEADMAN` state, keeping the blocks strictly immune to re-allocation until either: (1) the underlying D-state thread physically resolves in the kernel block layer, or (2) an administrator explicitly purges the quarantine using `dnpfs-dry --clear-quarantine <transaction_id>` (requiring `CAP_SYS_ADMIN`). **Quarantine Clearance Hardware Safety:** Before clearing quarantined sectors, `dnpfs.ko` issues a mandatory hardware block device flush (`blkdev_issue_flush`) and verifies that no pending request handles remain in the controller queue, guaranteeing that late-arriving hardware writes cannot land on re-allocated sectors. `dnpfsd` issues a persistent console warning if quarantined blocks exceed 5% of volume capacity or remain locked for >24 hours.
+* **Automated Deadman's Switch (Unattended Escalation, Block Quarantine & Reclamation CLI):** For headless NAS environments operating without a human administrator, `dnpfs.ko` implements an **Automated Deadman's Switch**. If an active transaction experiences zero physical I/O progress for longer than a configurable deadman threshold (default: 10 minutes), the kernel coordinator automatically marks the transaction `SUSPENDED_DEADMAN`, unblocks waiting threads with `ETIMEDOUT`/`EIO`, and logs a critical emergency alert to `syslog`/`dnpfsd`. **Critical Safety Rule:** To prevent double-allocation write corruption from zombie I/O landing late on reused sectors, the Deadman's Switch **never releases or reclaims target data blocks into the free allocation bitmap immediately**. Instead, the target block range is transitioned to a locked `QUARANTINED_DEADMAN` state, keeping the blocks strictly immune to re-allocation until either: (1) an administrator explicitly purges the quarantine using `dnpfs-dry --clear-quarantine <transaction_id>` (requiring `CAP_SYS_ADMIN`), or (2) **Automated Headless Burn-In Reclamation:** In unattended NAS mode, if S.M.A.R.T. diagnostics report zero hardware errors and the physical data device completes a 72-hour burn-in period without subsequent I/O failures, `dnpfsd` issues an automated quarantine purge, verifying hardware flush before reclaiming sectors. **Quarantine Clearance Hardware Safety:** Before clearing quarantined sectors, `dnpfs.ko` issues a mandatory hardware block device flush (`blkdev_issue_flush`) and verifies that no pending request handles remain in the controller queue, guaranteeing that late-arriving hardware writes cannot land on re-allocated sectors. `dnpfsd` issues a persistent console warning if quarantined blocks exceed 5% of volume capacity or remain locked for >24 hours.
 
 ---
 
@@ -520,6 +531,22 @@ PHASE 6: OPTIONAL BACKUP TRIGGER
 ```
 
 Delete operations follow the same flow but in reverse — reservation holds the blocks being freed, metadata is updated first to remove pointers, data blocks are released last, then TRIM is issued only after confirmation.
+
+### Dynamic Extent Chunking for Streaming / Appending Writes (Syscall Boundary Semantics)
+
+Standard file copies provide exact file sizes (`source.size_bytes`) upfront during Phase 1. However, POSIX applications performing streaming writes, growing file appends (`O_APPEND`), or logging frequently issue `write()` syscalls of unknown total duration and size. Triggering a 6-phase WAL lifecycle with FUA flushes on every single `write()` call would severely degrade throughput.
+
+To reconcile transactional safety with high-performance streaming POSIX `write()` I/O, DNPFS implements **Dynamic Extent Chunking**:
+
+1. **Pre-Allocated Chunk Spans (4 MB Default):** When a file is opened for writing without an explicit size hint, Phase 1 allocates a pre-reserved extent span of **4 MB (1,024 blocks)** on the data device.
+2. **Page-Cache Dirtying & In-RAM Verification:** Subsequent `write()` syscalls populate and dirty pages within this active 4 MB extent span in page cache, computing temporary in-RAM transit checksums.
+3. **Transaction Commit Boundaries:** A WAL manifest (`allocation_chunk.dry`) and confirmation FUA flush are committed to the SSD WAL **only when**:
+   - The active 4 MB pre-allocated extent span fills completely.
+   - The application invokes `fsync()`, `fdatasync()`, or `close()`.
+   - The OS page cache flusher (`wb_workfn`) triggers a dirty page flush.
+4. **Tail Truncation on Close:** When the file handle closes, any unwritten trailing blocks within the pre-allocated 4 MB chunk span are safely released back to the allocation bitmap.
+
+This bounds synchronization overhead to **1 FUA flush per 4 MB chunk span** (or per `fsync()`), maintaining high throughput for streaming and appending workloads without violating transactional crash safety!
 
 ### Random Writes and Truncations (Copy-On-Write)
 
