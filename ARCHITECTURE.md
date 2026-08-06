@@ -214,6 +214,13 @@ checksum:           u64                — 8 bytes (xxhash3_64 of inode structur
 
 *Note on Inode Table Capacity:* The inode table on the metadata SSD is dynamically growable. Unlike ext2/ext3's fixed-size tables formatted at creation time, DNPFS allocates metadata blocks in chained blocks of 512 inodes each as the number of files grows, eliminating the classic "out of inodes" constraint entirely.
 
+### Directory Indexing & HTree Lookup Strategy
+
+Directory structures in DNPFS map filename strings to 64-bit `inode_id` entries stored strictly on the metadata SSD:
+
+* **Small Directories ($\le 32$ entries):** Packed as a flat array of variable-length directory entries (`name_len: u16`, `inode_id: u64`, `name: [u8; name_len]`) within the directory inode's 4KB metadata block on the SSD, providing $O(1)$ RAM-cached linear evaluation.
+* **Large & Dense Directories ($> 32$ entries):** DNPFS implements a constant-depth **HTree Index** (a 2-level B-tree indexed by 32-bit `xxHash3_32(filename)` hashes). Directory leaf blocks are indexed by hash keys in HTree root blocks on the metadata SSD, guaranteeing $O(\log N)$ path-to-inode lookup latency for directories containing up to $10^6$ files.
+
 ### V1 POSIX File Type & Syscall Support (Symlinks, Hardlinks, xattrs, ACLs, mmap)
 
 * **Symlinks (100% Metadata SSD Storage & PATH_MAX Support):**
