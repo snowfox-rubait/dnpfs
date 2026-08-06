@@ -131,7 +131,7 @@ free_inodes:        u64
 root_inode:         u64
 last_mount_time:    timestamp
 last_write_time:    timestamp
-active_transaction_count: u32  — number of active, uncommitted transactions (marked dirty if > 0)
+dirty_flag:         bool  — set on mount (or when active transactions > 0), cleared on clean unmount (and count reaches 0)
 journal_offset:     u64
 checksum_table_offset: u64
 bad_block_map_offset:  u64
@@ -139,7 +139,7 @@ reservation_table_offset: u64
 superblock_checksum: u64  — xxhash3_64 of the superblock
 ```
 
-The `active_transaction_count` is the primary crash detection mechanism. If it is greater than 0 on mount, crash recovery is triggered automatically for all pending transaction manifests.
+The `dirty_flag` is the primary crash detection mechanism. It is set to `true` when the first concurrent transaction starts, and cleared to `false` only when the active transaction count in RAM drops to 0. If it is set on mount, crash recovery is triggered automatically for all pending transaction manifests found on the metadata device.
 
 ### Inode
 
@@ -297,6 +297,13 @@ last_verified:      timestamp
 member_count:       u32
 ```
 
+### RAM Bit-Flip Protection (Double-Checksumming in Transit)
+
+To protect against random DRAM corruption (e.g., from cosmic rays or faulty non-ECC memory modules), DNPFS implements double-checksum validation in transit:
+* **Write Path:** When a page is dirty-marked in the kernel page cache by VFS, the driver immediately computes a temporary 64-bit checksum and stores it in the page's VFS private descriptor in RAM. During Phase 4 (Execution), right before sending the block to the disk controller, the driver recomputes the checksum in RAM and verifies it against the dirty-page descriptor. If a mismatch is detected, the transaction aborts, the page is discarded, a kernel warning is issued, and VFS is requested to rewrite the block from cache.
+* **Read Path:** Right before copying data from the kernel page cache to the userspace application buffer (during the `read()` syscall), the driver recomputes the page's checksum and compares it to the verified block checksum stored on the SSD. If a bit flipped in RAM while the page was sitting in the cache, the check fails, the page is discarded, and the driver reloads the block from the physical HDD.
+* **Hardware Recommendation:** While transit checksumming protects data under the filesystem's direct control, it cannot protect data once it is copied to the application's private memory. DNPFS strongly recommends **ECC (Error-Correcting Code) RAM** for production deployments.
+
 ---
 
 ## The Allocation Manifest
@@ -408,12 +415,12 @@ PHASE 3: RESERVATION
   Suppress TRIM on reserved blocks
 
 PHASE 4: EXECUTION
-  Set dirty_flag = true
-  Flush dirty_flag to meta device
+  If active_transactions in RAM == 0: Set dirty_flag = true on superblock & flush meta device
+  Increment active_transactions counter in RAM
   Write metadata first (inode updates, directory entries)
   Flush meta device
   Write data blocks to data device
-  After each block: read back and verify checksum
+  After each block: read back and verify checksum (or dirty-page verify for RAM safety)
   On checksum mismatch: flag bad sector, find alternative, retry
 
 PHASE 5: CONFIRMATION
@@ -422,8 +429,8 @@ PHASE 5: CONFIRMATION
   Update bad block map if any issues detected
   Update manifest status to confirmed
   Write complete.dry summary
-  Set dirty_flag = false
-  Flush meta device
+  Decrement active_transactions counter in RAM
+  If active_transactions in RAM == 0: Set dirty_flag = false on superblock & flush meta device
   Release reservations
   Release TRIM suppression
 
@@ -455,7 +462,7 @@ To eliminate data loss risks from partial or interrupted moves, direct metadata-
 
 To prevent active readers from experiencing read blocks or downtime during a slow copy/move operation, DNPFS implements a metadata-level **Live-Migration Symlink Fallback** redirection:
 * **Pending Commit Flag:** When a write/copy begins, the inode is created immediately on the metadata device with the `INODE_PENDING_COMMIT` flag set in its `flags` field.
-* **Encapsulated Redirection:** The `fallback_path_offset` field in the inode points to the file path of the original source file on the host OS. This path is stored internally in the metadata table and is **never** exposed to userspace as a literal symlink (e.g., `readlink()` and `ls -l` will report the file as a normal regular file with its eventual size). To bypass mount namespace visibility issues (such as containers) and avoid redundant permission checks during reads, the driver opens the source file once during Phase 1 (Planning) using the initiator's namespace/credentials, obtaining an active kernel `struct file *` reference stored in RAM. The fallback read path directly invokes `kernel_read` on this file reference.
+* **Encapsulated Redirection:** The `fallback_path_offset` field in the inode points to the file path of the original source file on the host OS. This path is stored internally in the metadata table and is **never** exposed to userspace as a literal symlink (e.g., `readlink()` and `ls -l` will report the file as a normal regular file with its eventual size). To bypass mount namespace visibility issues (such as containers) and avoid redundant permission checks during reads, the driver opens the source file once during Phase 1 (Planning) using the initiator's namespace/credentials, obtaining an active kernel `struct file *` reference stored in RAM. The fallback read path directly invokes `kernel_read` on this file reference. To ensure kernel safety, this `struct file *` reference is owned and managed strictly by the global driver superblock context in RAM, not the initiating process. If the initiating process terminates, the file reference is kept alive by the global driver coordinator and is only released (`fput`) when the copy transaction either commits or aborts. Permission checks are performed once during Phase 1 using the initiator's credentials; all subsequent reads via the fallback bypass namespace and credentials boundaries safely.
 * **Source Mutation Protection:** During Phase 1 (Planning), the driver records the source file's `mtime`, `size`, and `inode_id` in the `allocation_<write_id>.dry` manifest. Every intercepted read request validates that the source file's current attributes match these records. If a mismatch is detected:
   * The read fails with `ESTALE` (Stale file handle) or `EIO`.
   * The copy transaction is aborted and rolled back.
@@ -488,7 +495,7 @@ DNPFS consists of three components:
 Implements the VFS interface for Linux. Handles:
 
 - Mount / unmount with UUID-based device pairing verification
-- active_transaction_count management
+- dirty_flag management
 - Block allocation and inode management
 - Write ordering enforcement between meta and data devices
 - TRIM suppression for reserved and in-flight blocks
@@ -520,12 +527,19 @@ If data device goes offline mid-write:
 ```
 Read superblock
 If dirty_flag == true:
-  Find most recent journal entry
-  Find corresponding allocation.dry
-  Cross-check: which blocks on data device match manifest checksums?
-  → Fully written: confirm operation, clear dirty_flag
-  → Partially written: roll back meta to pre-op snapshot
-  → Nothing written: discard manifest, state unchanged
+  Scan metadata device transaction directory for all pending manifests matching allocation_*.dry
+  For each pending manifest:
+    Read manifest
+    For each block in destination extent_map:
+      Read block from data device
+      Compute xxHash3 checksum in RAM
+      Compare computed checksum with expected checksum stored in manifest
+      → Match: mark block as committed
+      → Mismatch: discard block
+    → If all blocks in manifest are committed: confirm transaction, promote inode
+    → If any block failed/partially written: roll back meta to pre-op snapshot, discard transaction
+  Set dirty_flag = false on superblock
+  Flush superblock to meta device
 ```
 
 ### 2. Userspace Daemon (`dnpfsd`)
@@ -927,7 +941,9 @@ These are real constraints users should understand before adopting DNPFS. They a
 
 **Small file overhead.** Per-block checksums, inodes, reservations, and manifest entries have a fixed cost per file regardless of file size. For volumes with millions of tiny files, meta device space usage is higher than a traditional filesystem. The grouped checksum system reduces the performance overhead of verification but not the storage cost of individual checksum entries. Inline storage for very small files is planned as a future optimization.
 
-**Extent fragmentation under Copy-On-Write (COW).** Because all random-access modifications use COW, workloads involving frequent small writes to existing files (e.g. SQLite databases, VM disk images, active system logs) will cause rapid extent list growth. This will quickly exhaust the inode's 4 inline and 255 indirect blocks, leading to increased metadata lookup latency and higher space footprint. DNPFS is structurally optimized for bulk sequential storage and is not recommended for random write-heavy application database workloads.
+**Extent fragmentation and checksum group churn under Copy-On-Write (COW).** Because all random-access modifications use COW, workloads involving frequent small writes to existing files (e.g., SQLite databases, VM disk images, active system logs) will cause rapid extent list growth. Furthermore, because COW writes allocate new blocks in different physical spans, they mark both the source and destination 100-block groups as `suspect`, doubling checksum group write/recompute churn. This will exhaust the inode's 4 inline and 255 indirect blocks quickly, increasing metadata lookup latency and SSD write cycles. DNPFS is structurally optimized for bulk sequential storage and is not recommended for random write-heavy database workloads.
+
+**Fixed Reservation Table Capacity.** The reservation table is allocated as a static, fixed-size circular ring buffer (default: 1024 entries) on the metadata SSD during formatting. It cannot grow dynamically. Under heavy write concurrency exceeding 1024 concurrent transactions, new planning requests will block or fail with `EAGAIN` until active transactions commit.
 
 **No existing tool compatibility.** Standard tools (`fsck`, `testdisk`, `photorec`, `blkid`) do not understand DNPFS. All maintenance and recovery requires DNPFS-specific tooling. This improves as adoption grows.
 
