@@ -424,7 +424,7 @@ Unlike userspace leases, reservations in DNPFS are held strictly in RAM by the k
 * **Active Writes:** For long-running writes, the kernel driver maintains the reservation in RAM until the write physically completes and commits.
 * **Process Kills / Crashes (`SIGKILL`, OOM, abnormal exit):** If the writing process is killed or terminates prematurely while the OS kernel remains running, Linux VFS triggers standard file handle release callbacks (`f_op->release` / `f_op->flush`). The `dnpfs.ko` driver intercepts this callback, issues an **automatic transaction abort signal**, releases all held RAM reservations back to the free block bitmap, and deletes the pending manifest from `/transactions/`.
 * **Kernel Worker Deadlock / System Crash:** If an unrecoverable kernel thread deadlock or full OS crash occurs, the reservation remains held until the system reboots, at which point the boot-time recovery loop scans `/transactions/` and safely rolls back the interrupted transaction.
-* **Uninterruptible D-State Processes & Admin Override:** If a writing process gets stuck in an uninterruptible sleep state (D-state) due to physical I/O errors on a dying data HDD (preventing standard release callbacks from firing), system administrators can forcefully abort the transaction using the `dnpfs-dry --force-abort <transaction_id>` utility. This issues an explicit driver IOCTL (`DNPFS_IOC_ABORT_TRANSACTION`, requiring `CAP_SYS_ADMIN`), which forcefully revokes held RAM reservations, purges the manifest from `/transactions/`, and wakes up any blocked threads with `EINTR`.
+* **Uninterruptible D-State Processes & Admin Override:** If a writing process gets stuck in an uninterruptible sleep state (D-state) due to physical I/O errors on a dying data HDD (preventing standard release callbacks from firing), system administrators can forcefully abort the transaction using the `dnpfs-dry --force-abort <transaction_id>` utility. This issues an explicit driver IOCTL (`DNPFS_IOC_ABORT_TRANSACTION`, requiring `CAP_SYS_ADMIN`), which forcefully revokes held RAM reservations, purges the manifest from `/transactions/`, and wakes up any blocked reader/writer threads with `EINTR`. *(Note on D-State Threads: Force-abort revokes the filesystem reservations and unblocks other processes waiting on the inode; the original stuck D-state thread itself remains blocked in the kernel block layer until the physical disk I/O completes or times out).*
 
 ---
 
@@ -564,6 +564,8 @@ If data device goes offline mid-write:
   → Mark operation as failed in manifest
   → Release reservations
 ```
+
+*Note on Headless / Unattended Operations:* In headless environments (NAS, automated servers, no interactive TTY), if no response is received within a configurable timeout (default: 30 seconds), `dnpfs.ko` automatically executes **Option C (Halt and Preserve Current State)**: data I/O is safely halted, the transaction is suspended, and a critical error is logged to `syslog`/`dmesg`.
 
 **On power loss detection (boot-time):**
 
@@ -738,6 +740,14 @@ The userspace daemon polls both devices using S.M.A.R.T. and caches the results 
 | SSD Wear Leveling Count low | Absolute: $< 10\%$ remaining life | Warning, meta device approaching end of life |
 
 S.M.A.R.T. data is stored locally on the meta device with timestamps to allow trend analysis — a slowly rising remap count is more dangerous than a stable high count.
+
+### Unified Escalation Ladder (Drive-Level vs. Filesystem-Level Signals)
+
+DNPFS tracks drive health via two complementary metrics operating at different layers:
+- **Hardware-Level (Drive S.M.A.R.T. Firmware):** Tracks physical internal remaps managed by drive controllers (e.g., >100 reallocated sectors). Signals hardware degradation before filesystem writes fail.
+- **Filesystem-Level (DNPFS Bad Block Map):** Tracks I/O failures directly experienced by DNPFS during Phase 4 write verification or read scrubbing (e.g., 5,000 logical bad blocks). Signals filesystem I/O safety limits.
+
+**Reconciliation Policy:** The system treats both metrics as independent triggers on a unified health ladder: reaching *either* hardware critical thresholds (S.M.A.R.T. >100 remaps) OR filesystem safety bounds (5,000 logical bad blocks) immediately escalates volume posture to `CRITICAL_DEGRADATION`, triggering automatic metadata backups and issuing persistent administrator warnings.
 
 ---
 

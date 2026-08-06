@@ -70,7 +70,7 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for the full technical specification in
 - Bad sector handling and silent failure detection
 - S.M.A.R.T. integration thresholds
 - Metadata backup and restore
-- Encryption modes (LUKS, 4 options, chained unlock)
+- Block-layer encryption (LUKS via cryptsetup; native key-chaining planned for V2)
 - RAID compatibility and recommended configurations
 - TRIM/discard coordination
 - Concurrent operation handling
