@@ -456,9 +456,9 @@ To prevent active readers from experiencing read blocks or downtime during a slo
     * `write()` / `open(O_WRONLY)`: The initial write worker executes the write; concurrent write requests from other processes return `EBUSY`.
   * `rename()`: **Allowed.** Modifying directory names updates only the SSD directory pointer to the inode's fixed `inode_id`. Write transactions are tracked by `inode_id`, keeping block copies completely unaffected by path renames.
   * `unlink()`: **Allowed (Ordered Abort Sequence):**
-    1. **Untrack:** The driver immediately removes the file's directory entry on the SSD, hiding it from userspace.
+    1. **Untrack:** The driver immediately removes the file's directory entry on the SSD, hiding it from userspace (preventing any *new* handles from opening).
     2. **Abort Signal:** Sets an `ABORT_PENDING` flag on the active transaction.
-    3. **Worker Stop:** The write worker checks the flag at its next block write-and-verify boundary, stops sequential writing, and cleans up its VFS structures.
+    3. **Worker Stop:** The write worker checks the flag at its next block write-and-verify boundary, stops sequential writing, and cleans up its VFS structures. (Allowing the worker to finish its current block write is a deliberate design choice to prevent torn writes at the disk layer).
     4. **Release Reservations:** Once the worker has safely terminated, the driver releases the blocks back to the free block bitmap, preventing block reuse concurrency races.
     5. **Reader Wakeup:** Wakes any readers sleeping on the transaction's commit wait-queue, immediately returning `ENOENT`.
     6. **POSIX-compliant In-Flight Reads:** If a reader is actively streaming via Live-Migration fallback when `unlink()` occurs, the driver keeps the internal source file descriptor open and continues serving reads from the original source file until the user closes the local file handle.
