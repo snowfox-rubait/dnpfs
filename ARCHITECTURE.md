@@ -230,9 +230,8 @@ reservation_id:     uuid
 manifest_path:      path to allocation.dry
 blocks_held:        [u64]  — data device block addresses
 created:            timestamp
-expires:            timestamp
 operation_type:     enum { write, delete, copy, rename }
-status:             enum { pending, committed, rolled_back, expired }
+status:             enum { pending, committed, rolled_back, aborted }
 ```
 
 ---
@@ -354,7 +353,6 @@ manifest_version: 1
 manifest_id: uuid
 operation_type: write | delete | copy
 created: timestamp
-expires: timestamp
 reservation_id: uuid
 
 source:
@@ -590,7 +588,7 @@ If manifests exist:
 Runs as a background service. Handles:
 
 - S.M.A.R.T. polling on both devices (configurable interval, default 1 hour)
-- Reservation expiry enforcement
+- Orphaned transaction monitoring and health logging
 - Incremental meta device backups
 - Idle-time defragmentation scheduling on meta device
 - Bad sector escalation alerts
@@ -620,7 +618,7 @@ Drive firmware can confirm a write while data is still in the drive's internal v
 
 ### The Solution
 
-**Force Unit Access (FUA):** For all critical transaction logs (WAL head pointers, superblock `active_transaction_count`, and `allocation.dry` state commits), the driver issues writes with the FUA flag set. This instructs the drive to flush its internal cache to non-volatile storage before confirming. Drives that do not support FUA will have write caching disabled in the driver.
+**Force Unit Access (FUA):** For all critical transaction logs (WAL head pointers, superblock metadata updates, and `allocation.dry` state commits), the driver issues writes with the FUA flag set. This instructs the drive to flush its internal cache to non-volatile storage before confirming. Drives that do not support FUA will have write caching disabled in the driver.
 
 **Explicit write ordering (Split-Path Design):**
 To reconcile transactional safety with wear mitigation, DNPFS separates log writes from actual structural updates:
@@ -728,13 +726,13 @@ During dry run, the target block range is cross-referenced against the bad_block
 
 The userspace daemon polls both devices using S.M.A.R.T. and caches the results on the meta device. The following attributes are monitored:
 
-| Attribute | Action on threshold |
-|---|---|
-| Reallocated Sector Count rising | Warn user, lower backup trigger thresholds |
-| Pending Sector Count > 0 | Flag affected blocks in bad_block_map as suspect |
-| Uncorrectable Error Count > 0 | Urgent warning, recommend immediate backup |
-| Reallocated Sector Count high | Critical warning, data device may be near end of life |
-| SSD Wear Leveling Count low | Warning, meta device approaching end of life |
+| Attribute | Quantitative Condition | Action on threshold |
+|---|---|---|
+| Reallocated Sector Count rising | Trend: $\Delta > 5$ remapped sectors/hour | Warn user, lower backup trigger thresholds |
+| Pending Sector Count > 0 | Absolute: $> 0$ pending sectors | Flag affected blocks in bad_block_map as suspect |
+| Uncorrectable Error Count > 0 | Absolute: $> 0$ uncorrectable errors | Urgent warning, recommend immediate backup |
+| Reallocated Sector Count high | Absolute: $> 100$ total remapped sectors | Critical warning, data device near end of life |
+| SSD Wear Leveling Count low | Absolute: $< 10\%$ remaining life | Warning, meta device approaching end of life |
 
 S.M.A.R.T. data is stored locally on the meta device with timestamps to allow trend analysis — a slowly rising remap count is more dangerous than a stable high count.
 
@@ -918,7 +916,9 @@ Multiple processes may attempt operations simultaneously. DNPFS handles this wit
 - Reservations are granted in order of request.
 - A new dry run that would require blocks already reserved must wait or fail with a retry signal.
 - Directory entry locks are held for the duration of any operation that modifies directory structure.
-- Read operations do not require reservations but do check the TRIM suppression list — a read of a reserved block returns the pre-reservation data (reads the current on-disk state, not the pending state).
+- Read operations do not require reservations but do check the TRIM suppression list:
+  - **For Copy-On-Write Overwrites:** A read of a reserved block returns the pre-reservation data (reads the original, unmodified on-disk block state while the write proceeds).
+  - **For Brand-New File Writes:** The destination blocks have no pre-existing data; read requests to the pending inode follow the `INODE_PENDING_COMMIT` rule (blocking on the commit wait-queue or returning `EBUSY` if `O_NONBLOCK` is set).
 
 ### Queue & Coordination
 
