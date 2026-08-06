@@ -265,8 +265,8 @@ Group 0 (blocks 0–99):   xxhash3_64 of [checksum0 + checksum1 + ... + checksum
 Group 1 (blocks 100–199): xxhash3_64 of [checksum100 + ... + checksum199]
 ```
 
-**V1 Group Checksum Maintenance under COW & Deletions:**
-In V1, whenever a Copy-On-Write write or file deletion allocates new blocks or releases existing ones, the Level 2 group checksums for all affected 100-block groups are **synchronously updated in Phase 5 (Confirmation)**. Because Level 2 group hashes are calculated in RAM directly from the active 64-bit Level 1 block checksums (without needing to re-read data blocks from the physical HDD), synchronous group checksum updates incur zero physical disk I/O overhead. This guarantees that on-disk Level 2 group checksums remain 100% consistent across all COW operations in V1.
+**V1 Group Checksum Maintenance under COW, Deletions & Bad-Sector Remaps:**
+In V1, whenever a Copy-On-Write write, file deletion, or Branch 1 bad-sector block reallocation (moving block X → Y during Phase 4 write verification) alters block allocations, the Level 2 group checksums for all affected 100-block groups (including both the source bad-sector group and destination reallocated group) are **synchronously updated in Phase 5 (Confirmation)**. Because Level 2 group hashes are calculated in RAM directly from active 64-bit Level 1 block checksums (without needing to re-read data blocks from the physical HDD), synchronous group checksum updates incur zero physical disk I/O overhead. This guarantees that on-disk Level 2 group checksums remain 100% consistent across all COW, deletion, and bad-sector remap operations in V1.
 
 **Routine health check flow (Data Verification / Scrubbing):**
 
@@ -335,7 +335,7 @@ member_count:       u32
 
 To protect against random DRAM corruption (e.g., from cosmic rays or faulty non-ECC memory modules), DNPFS implements double-checksum validation in transit:
 * **Write Path:** When a page is dirty-marked in the kernel page cache by VFS, the driver immediately computes a temporary 64-bit checksum and stores it in the page's VFS private descriptor in RAM. During Phase 4 (Execution), right before sending the block to the disk controller, the driver recomputes the checksum in RAM and verifies it against the dirty-page descriptor. If a mismatch is detected, the transaction aborts, the page is discarded, a kernel warning is issued, and VFS is requested to rewrite the block from cache.
-* **Long-Dwelling Dirty Pages:** Dirty pages in the page cache are validated upon initial VFS dirtying and immediately prior to Phase 4 disk submission. If dirty pages remain uncommitted in memory for extended periods, standard Linux page cache flusher threads (`wb_workfn` / `pdflush`) trigger periodic flushes, executing Phase 4 transit verification before memory pressure eviction occurs. Continuous background polling of in-RAM dirty pages is explicitly out of scope to avoid memory bus bandwidth contention.
+* **Long-Dwelling Dirty Pages:** No active in-RAM polling mechanism is required. The dirty-page checksum window (comparing initial VFS dirtying against pre-disk submission in Phase 4) intrinsically protects data regardless of how long dirty pages dwell in memory before being flushed by standard OS page cache flusher threads (`wb_workfn`).
 * **Read Path (Optional):** By default, checksums are verified only when a block is first read from the physical HDD into the kernel page cache. Subsequent cache-hit reads bypass checksum re-evaluation to preserve memory throughput. For environments requiring extreme paranoia, a mount flag (`verify=paranoid_cache`) can be enabled to force the driver to recompute the xxHash3 checksum right before copying data from the page cache to the userspace buffer on *every* `read()` syscall. If a RAM bit-flip is detected, the page is discarded and reloaded from the HDD.
 * **Hardware Recommendation:** While transit checksumming protects data under the filesystem's direct control, it cannot protect data once it is copied to the application's private memory. DNPFS strongly recommends **ECC (Error-Correcting Code) RAM** for production deployments.
 
@@ -716,7 +716,7 @@ Checksum mismatch detected during file read or background scrubbing:
 ```
 
 **Bad Block Map Sizing & Thresholds:**
-Each entry in `bad_block_map` is a compact 16-byte record (`sector_offset` u64 + `flags` u64). Even on a severely degraded HDD with 10,000 bad sectors, the total map consumes only ~160 KB of metadata space. If bad sector accumulation exceeds a configurable threshold (default: 5,000 bad sectors), `dnpfsd` issues a critical drive health warning advising immediate hardware replacement. No bad sector entries are evicted; records are retained permanently to prevent re-allocation of defective sectors for the lifetime of the paired volume.
+Each entry in `bad_block_map` is a compact 16-byte record (`sector_offset` u64 + `flags` u64). Even on a severely degraded HDD with 10,000 bad sectors, the total map consumes only ~160 KB of metadata space. If bad sector accumulation exceeds a configurable threshold (default: 5,000 bad sectors), `dnpfsd` issues a critical drive health warning advising immediate hardware replacement. Exceeding this threshold is strictly advisory; by design, DNPFS does not enforce a hard mount or write block, continuing to permanently record and bypass all defective sectors without evicting records for the lifetime of the paired volume.
 
 ### allocation.dry Integration
 
