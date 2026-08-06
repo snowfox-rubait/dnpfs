@@ -269,6 +269,10 @@ To achieve high write-performance, DNPFS implements **Deferred Checksumming** du
 2. **At Idle Time:** Once the system is idle, `dnpfsd` runs a background task to compute the individual file/block checksums and save them to the metadata device.
 3. **If a Mismatch Occurs before Idle Checksumming:** The filesystem falls back to the group-level verification and rolls back the entire group to its pre-operation snapshot. If it occurs after idle checksumming has run, the system uses the stored individual checksums to pinpoint the exact corrupted file.
 
+**Composition (How Block-level and File-level Grouping Align):**
+* **File-level grouping** is a logical transaction-bundling utility used strictly during Phase 1–3 of writes to group multiple small files into a single contiguous extent range allocation in the manifest, saving write-overhead.
+* **Block-level grouping** (the static 100-block table) is the physical layout format on the metadata SSD. Once a file transaction is committed, its allocated blocks are registered within these static 100-block on-disk groups, which are subsequently managed and verified by the background scrubber.
+
 ### Why This Matters for Small Files
 
 Per-block checksums have disproportionate overhead for small files. A 32-byte SHA-256 checksum on a 100-byte file is 32% overhead just for the checksum entry, not counting inode and directory cost. Group checksums amortize this — the group check covers multiple files in one operation. Individual checksums for small files still exist but are only read when the group check fails.
@@ -444,9 +448,13 @@ To prevent active readers from experiencing read blocks or downtime during a slo
   * The copy transaction is aborted and rolled back.
 * **Crash Recovery Persistence:** If a system crash occurs mid-copy, the boot-time recovery manager scans for pending manifests and re-establishes the temporary in-RAM redirection tables, ensuring data availability until the transaction is either rolled back or completed.
 * **Syscall Interception:**
-  * `read()` / `open(O_RDONLY)`: The VFS driver intercepts read requests to the pending inode and transparently redirects them to read from the original source file.
-  * `write()` / `open(O_WRONLY)`: Any write operations requested by other processes return `EBUSY`.
-  * `rename()` / `unlink()`: Directory modifications on pending inodes return `EBUSY`.
+  * **Pending with Fallback Source:**
+    * `read()` / `open(O_RDONLY)`: The VFS driver intercepts read requests to the pending inode and transparently redirects them to read from the original source file.
+    * `write()` / `open(O_WRONLY)`: Any write operations requested by other processes return `EBUSY`.
+  * **Pending without Fallback Source (New File Writes):**
+    * `read()` / `open(O_RDONLY)`: In blocking mode (default), the read call blocks (putting the thread to sleep in a commit wait-queue) until the transaction completes and the flag is cleared. In non-blocking mode (`O_NONBLOCK`), the call returns `EAGAIN` or `EBUSY` immediately.
+    * `write()` / `open(O_WRONLY)`: The initial write worker executes the write; concurrent write requests from other processes return `EBUSY`.
+  * `rename()` / `unlink()`: Directory modifications on any pending inodes return `EBUSY`.
 * **Atomic Promotion:** Once the copy completes and passes checksum validation, the driver atomically clears the `INODE_PENDING_COMMIT` flag and the `fallback_path_offset` field, promoting the file to a standard local DNPFS inode. If a move was requested, the source file deletion is then safely triggered.
 
 ---
