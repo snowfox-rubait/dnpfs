@@ -112,6 +112,17 @@ Both devices are identified by **UUID only** — never by `/dev/sdX` names, whic
 
 To protect against metadata corruption, the metadata device maintains **Redundant Superblocks** at fixed offsets (e.g., primary at `0x1000`, with backups at block offsets 1024, 8192, and 32768).
 
+### Self-Contained Plug-and-Play Bootstrap Partition (`DNPFS_BOOTSTRAP`)
+
+To solve the portability limitation (mounting DNPFS on computers that lack pre-installed drivers), `dnpfs-format` supports partitioning the metadata SSD into two logical partitions:
+
+1. **Partition 1: `DNPFS_BOOTSTRAP` (256 MB FAT32 / ISO9660):**
+   - A standard, universally compatible FAT32 partition mounted automatically by Linux, macOS, and Windows desktops.
+   - Houses offline driver installation packages (`dnpfs-dkms`), statically compiled userspace binaries (`dnpfs-fuse` AppImage, `dnpfs-tools`), desktop launcher scripts (`dnpfs-mount.sh`), and `udev` rule helpers.
+   - **Zero-Install Mount:** Users can plug the SSD into any host and run `./dnpfs-mount` directly from the FAT32 partition to mount the DNPFS volume instantly via bundled FUSE, without requiring an internet download or root kernel module installation.
+2. **Partition 2: `DNPFS_META` (Remaining SSD Capacity):**
+   - Houses the raw DNPFS metadata structures (Superblock, Transaction Region, Inode Table, Checksum Maps, Bad Block Maps).
+
 ### Metadata Sizing Ratio Derivation (1.0% – 1.5%)
 
 The required metadata device capacity relative to data device capacity ($1.0\% \text{ to } 1.5\%$) is derived mathematically using exact block allocation calculations:
@@ -1035,7 +1046,7 @@ dnpfs-import --backup meta-backup.img --data-device /dev/sdX
 
 These are real constraints users should understand before adopting DNPFS. They are accepted tradeoffs, not bugs.
 
-**Not portable.** DNPFS requires the kernel module installed on any machine that mounts the volume. FAT32 is understood by every OS on earth. DNPFS requires a custom driver. Until it is merged into the Linux kernel mainline and recognized by standard tools, it is a manual install on every machine.
+**Not portable natively.** DNPFS requires a custom driver or userspace FUSE runner on hosts that mount the volume. To solve this, DNPFS volumes formatted with the optional **Self-Contained Plug-and-Play Bootstrap Partition (`DNPFS_BOOTSTRAP`)** embed a 256MB FAT32 partition containing standalone `dnpfs-fuse` AppImage binaries, DKMS driver packages, and mount scripts. This allows any computer to immediately mount the volume without downloading external software.
 
 **Not bootable.** By design. DNPFS is a storage filesystem. The OS cannot boot from it because the kernel module is not loaded at boot time. This is a conscious tradeoff accepted at the design stage.
 
