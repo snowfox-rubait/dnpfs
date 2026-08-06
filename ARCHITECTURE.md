@@ -272,6 +272,7 @@ To achieve high write-performance, DNPFS implements **Deferred Checksumming** du
 **Composition (How Block-level and File-level Grouping Align):**
 * **File-level grouping** is a logical transaction-bundling utility used strictly during Phase 1–3 of writes to group multiple small files into a single contiguous extent range allocation in the manifest, saving write-overhead.
 * **Block-level grouping** (the static 100-block table) is the physical layout format on the metadata SSD. Once a file transaction is committed, its allocated blocks are registered within these static 100-block on-disk groups, which are subsequently managed and verified by the background scrubber.
+* **Group Checksum Invalidation on Block Release:** When blocks are freed (e.g. during a Copy-On-Write update or file deletion), the affected 100-block group checksum on the SSD is marked as "stale/dirty" by setting its status flag to `suspect`. During the next background scrub or idle period, `dnpfsd` recomputes the group checksum from the remaining active block hashes.
 
 ### Why This Matters for Small Files
 
@@ -920,6 +921,8 @@ These are real constraints users should understand before adopting DNPFS. They a
 **Meta device is the critical dependency.** If the meta device fails without a backup, the data device becomes a pile of unaddressed raw blocks. The system is designed with this asymmetry in mind — the meta device receives paranoid protection precisely because of this.
 
 **Small file overhead.** Per-block checksums, inodes, reservations, and manifest entries have a fixed cost per file regardless of file size. For volumes with millions of tiny files, meta device space usage is higher than a traditional filesystem. The grouped checksum system reduces the performance overhead of verification but not the storage cost of individual checksum entries. Inline storage for very small files is planned as a future optimization.
+
+**Extent fragmentation under Copy-On-Write (COW).** Because all random-access modifications use COW, workloads involving frequent small writes to existing files (e.g. SQLite databases, VM disk images, active system logs) will cause rapid extent list growth. This will quickly exhaust the inode's 4 inline and 255 indirect blocks, leading to increased metadata lookup latency and higher space footprint. DNPFS is structurally optimized for bulk sequential storage and is not recommended for random write-heavy application database workloads.
 
 **No existing tool compatibility.** Standard tools (`fsck`, `testdisk`, `photorec`, `blkid`) do not understand DNPFS. All maintenance and recovery requires DNPFS-specific tooling. This improves as adoption grows.
 
