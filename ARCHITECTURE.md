@@ -142,6 +142,9 @@ $$\text{Total Metadata Ratio (Standard Workload)} = 0.4883\% + (0.3906\% \text{ 
 ```
 magic:              0x444E5046 ("DNPF")
 version:            u32
+compat_flags:       u32   — compatible feature flags (safe for older drivers)
+incompat_flags:     u32   — incompatible feature flags (refuse mount if unrecognized)
+ro_compat_flags:    u32   — read-only compatible flags (mount read-only if unrecognized)
 uuid_meta:          uuid (16 bytes)
 uuid_data:          uuid (16 bytes) — paired data device
 block_size:         u32
@@ -150,6 +153,7 @@ total_inodes:       u64
 free_data_blocks:   u64
 free_inodes:        u64
 root_inode:         u64
+transaction_region_offset: u64 — pre-allocated transaction region on META device
 last_mount_time:    timestamp
 last_write_time:    timestamp
 journal_offset:     u64
@@ -159,7 +163,11 @@ reservation_table_offset: u64
 superblock_checksum: u64  — xxhash3_64 of the superblock
 ```
 
-DNPFS does not store a global dirty flag or active transaction counter in the superblock (which would bottleneck parallel commits and suffer from RAM-disk desync races). Instead, crash recovery is triggered dynamically on mount/load if the `/transactions/` directory on the metadata device contains any uncommitted `allocation_*.dry` manifests.
+DNPFS does not store a global dirty flag or active transaction counter in the superblock (which would bottleneck parallel commits and suffer from RAM-disk desync races). Instead, crash recovery is triggered dynamically on mount/load if the transaction region on the metadata device contains any uncommitted `allocation_*.dry` manifests.
+
+*Note on On-Disk Feature Flags:* Feature bitmasks (`compat_flags`, `incompat_flags`, `ro_compat_flags`) enable forward and backward format extensibility without requiring full format version bumps. Unrecognized `incompat_flags` cause `dnpfs.ko` to safely refuse mounting, while unrecognized `ro_compat_flags` force a read-only mount posture.
+
+*Note on Transaction Region Storage Model (Bootstrapping Solution):* The `/transactions/` path referenced in manifests is a virtual representation presented by userspace tools (`dnpfsd`, `dnpfs-dry`). Physically on disk, transactions are stored in a dedicated, fixed-offset **Transaction Region** (`transaction_region_offset` in the superblock, pre-allocated during `dnpfs-format`). Manifests are written as fixed-size raw slots in this metadata ring buffer. This completely eliminates any filesystem bootstrapping paradox during boot-time crash recovery: the recovery manager reads raw manifest slots from `transaction_region_offset` without needing to parse or mount a standard directory hierarchy first.
 
 *Note on Growable Limits:* Like the inode table, the reservation table is **dynamically growable**. The `reservation_table_offset` points to a head block. As concurrent transactions increase, the driver allocates new metadata blocks dynamically (chained via `next_block` pointers), eliminating arbitrary bounds on transaction concurrency.
 
@@ -171,8 +179,11 @@ DNPFS does not store a global dirty flag or active transaction counter in the su
 inode_id:           u64
 file_size:          u64
 block_count:        u64
+link_count:         u32                — hardlink reference count (0 = free on delete)
+mode_flags:         u32                — file type (regular, directory, symlink) & mode bits
 extents:            [dnpfs_extent; 4]  — first 4 inline extents, 5th+ via indirect_extent_block
 indirect_extent_block: u64 | null      — points to secondary extent block on META device (indirection)
+symlink_target:     [u8; 255]          — inline symlink target path (if file type is symlink)
 created:            timestamp
 modified:           timestamp
 permissions:        u32
@@ -183,6 +194,15 @@ checksum:           u64  — xxhash3_64 of this inode structure
 ```
 
 *Note on Inode Table Capacity:* The inode table on the metadata SSD is dynamically growable. Unlike ext2/ext3's fixed-size tables formatted at creation time, DNPFS allocates metadata blocks in chained blocks of 512 inodes each as the number of files grows, eliminating the classic "out of inodes" constraint entirely.
+
+### V1 POSIX File Type & Syscall Support (Symlinks, Hardlinks, xattrs, ACLs, mmap)
+
+* **Symlinks (V1 Native Support):** Symlink targets up to 255 bytes are stored inline within the inode (`symlink_target: [u8; 255]`), avoiding extra metadata block allocations. Symlink lookups are $O(1)$ directly from the inode. Fully supported in V1 for Plex/Jellyfin media libraries and dotfile management.
+* **Hardlinks (V1 Native Support):** Multiple directory entries may reference the same `inode_id`. The inode tracks references via `link_count: u32`. When a file is unlinked, `link_count` decrements; data blocks and metadata are freed only when `link_count` reaches 0. Fully supported in V1 for `rsync --link-dest` backup rotation.
+* **Extended Attributes (xattrs) & POSIX ACLs (Planned for V2):** xattr blocks and POSIX ACL permission structures are deferred to V2. V1 returns `ENOTSUP` for xattr/ACL syscalls (`getxattr`, `setxattr`).
+* **Explicit `mmap()` Compliance Policy:**
+  - `mmap(PROT_READ)` is natively supported for zero-copy read operations.
+  - `mmap(PROT_WRITE)` with `MAP_SHARED` is **unsupported in V1** (returns `ENODEV` / `EINVAL`), requiring applications to use explicit `pwrite()` / `write()` syscalls. This explicitly protects the Phase 1–6 dry-run and checksum verification pipeline in V1. Applications requiring random write access (e.g. SQLite databases) are instructed to use direct I/O (`O_DIRECT`) or explicit `pwrite()` calls.
 
 **dnpfs_extent structure:**
 ```
@@ -425,6 +445,7 @@ Unlike userspace leases, reservations in DNPFS are held strictly in RAM by the k
 * **Process Kills / Crashes (`SIGKILL`, OOM, abnormal exit):** If the writing process is killed or terminates prematurely while the OS kernel remains running, Linux VFS triggers standard file handle release callbacks (`f_op->release` / `f_op->flush`). The `dnpfs.ko` driver intercepts this callback, issues an **automatic transaction abort signal**, releases all held RAM reservations back to the free block bitmap, and deletes the pending manifest from `/transactions/`.
 * **Kernel Worker Deadlock / System Crash:** If an unrecoverable kernel thread deadlock or full OS crash occurs, the reservation remains held until the system reboots, at which point the boot-time recovery loop scans `/transactions/` and safely rolls back the interrupted transaction.
 * **Uninterruptible D-State Processes & Admin Override:** If a writing process gets stuck in an uninterruptible sleep state (D-state) due to physical I/O errors on a dying data HDD (preventing standard release callbacks from firing), system administrators can forcefully abort the transaction using the `dnpfs-dry --force-abort <transaction_id>` utility. This issues an explicit driver IOCTL (`DNPFS_IOC_ABORT_TRANSACTION`, requiring `CAP_SYS_ADMIN`), which forcefully revokes held RAM reservations, purges the manifest from `/transactions/`, and wakes up any blocked reader/writer threads with `EINTR`. *(Note on D-State Threads: Force-abort revokes the filesystem reservations and unblocks other processes waiting on the inode; the original stuck D-state thread itself remains blocked in the kernel block layer until the physical disk I/O completes or times out).*
+* **Automated Deadman's Switch (Unattended Escalation):** For headless NAS environments operating without a human administrator, `dnpfs.ko` implements an **Automated Deadman's Switch**. If an active transaction experiences zero physical I/O progress for longer than a configurable deadman threshold (default: 10 minutes), the kernel coordinator automatically marks the transaction `SUSPENDED_DEADMAN`, revokes held RAM reservations to prevent starving other transactions, purges the manifest from the transaction region, and logs a critical alert to `syslog`/`dnpfsd`.
 
 ---
 
@@ -927,6 +948,7 @@ Multiple processes may attempt operations simultaneously. DNPFS handles this wit
 - **Multiple Allocation Manifests:** Rather than a single global file, each active transaction utilizes a dedicated `allocation_<write_id>.dry` manifest. This reduces write contention and allows independent operations to proceed concurrently.
 - Two operations may not hold overlapping block reservations.
 - Reservations are granted in order of request.
+- **Starvation Prevention & Priority Aging:** To prevent long-running reservations from starving smaller overlapping write requests indefinitely, the reservation coordinator implements **Priority Aging**. Reservation waiters accumulate priority based on wait duration ($\text{priority} = \text{wait\_time\_ms} \times \text{weight}$). If a waiter's target block range overlaps a long-held reservation and waits longer than 5,000 ms, the coordinator elevates its priority to `HIGH_PRIORITY_INHERITANCE`, pausing new non-conflicting reservations until the aged waiter is granted allocation space.
 - A new dry run that would require blocks already reserved must wait or fail with a retry signal.
 - Directory entry locks are held for the duration of any operation that modifies directory structure.
 - Read operations do not require reservations but do check the TRIM suppression list:
@@ -1059,6 +1081,7 @@ Even with FUA, some drive firmware reports confirmation before physical write is
 ## Prior Art & Design Precedents
 
 DNPFS builds upon several established structural paradigms and caching drivers in the Linux filesystem space:
+* **XFS Realtime Subvolumes (`rtdev`):** XFS supports allocating real-time data extents onto a dedicated secondary block device (`mkfs.xfs -r rtdev=/dev/meta-ssd`). While XFS `rtdev` physically separates data extents, it does not provide per-block xxHash3 verification, dry-run transactional manifests (`allocation.dry`), forensic write-state recovery, or bad sector map tracking. DNPFS is designed specifically to fill this gap for paranoid storage where write verification and forensic recovery take priority over traditional POSIX real-time file systems.
 * **ZFS Special VDEV Class:** ZFS allows allocating specific metadata blocks, DDT (deduplication tables), and small files to dedicated SSD devices. DNPFS takes this partition isolation further by mandating physical separation at the device driver layer.
 * **Ext4 External Journal:** Ext4 has long supported allocating its journal and transaction logs to a separate fast physical block device (`ext4 -J device=...`), separating synchronous log writes from primary metadata and data.
 * **bcache & dm-cache:** These drivers operate as block-level SSD caching layers underneath generic filesystems. DNPFS is a native filesystem rather than a block-level cache, allowing it to leverage semantic filesystem data (such as size-based extent grouping, transaction verification, and live fallbacks) that block-level caches cannot access.
