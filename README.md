@@ -2,6 +2,28 @@
 
 > *"It's not paranoia if the disk is actually dying."*
 
+---
+
+## ⚠️ ARCHIVED
+
+**This project has been cancelled and is archived as-is. No further development is planned.**
+
+When I started DNPFS, I assumed nothing like it existed. I was wrong.
+**ZFS with Special VDEVs** already covers most of what DNPFS was trying to solve — metadata/data physical separation, per-block checksums, COW writes, bad block tracking, scrubbing, RAID, and more — and it does it in a battle-tested, production-grade implementation that has been running in the real world for decades.
+
+The handful of things DNPFS has that ZFS doesn't:
+- **Pre-write auditable allocation manifests** (`allocation.dry`) — the dry-run transaction log you can inspect before execution
+- **Hard structural metadata separation** at the device driver layer (not just a hint like ZFS Special VDEV)
+- **Self-contained bootstrap partition** for zero-download portability
+
+These are real design choices and they are the literal identity of the project. But honestly? They aren't a big enough deal to justify building and maintaining a full filesystem from scratch when ZFS already handles everything else better than DNPFS ever would have in its current pre-implementation state.
+
+If you want metadata/data separation on Linux today: **use ZFS with a Special VDEV**. It works.
+
+The architecture document (`ARCHITECTURE.md`) is left intact. If any of the ideas here are useful to you — especially the `allocation.dry` concept or the bootstrap partition design — take them. The core ideas that survived the cancellation have been spun off into a lightweight hobby implementation at [DNPFS-Nerfed](https://github.com/rubait/DNPFS-nerfed) (if that ever goes public), which strips the project down to just those three signature features and nothing else.
+
+---
+
 DNPFS is an open source Linux filesystem that separates raw data storage from all filesystem structures across two physical devices. Your large drive stores only raw data blocks. A small, fast secondary drive stores everything else — metadata, journal, checksums, bad block maps, and bookkeeping. Nothing else lives on either drive.
 
 This is not a RAID setup. This is not a cache layer. This is a ground-up rethink of where filesystem structures should physically live.
