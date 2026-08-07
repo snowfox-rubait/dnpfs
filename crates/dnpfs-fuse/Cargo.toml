@@ -1,0 +1,14 @@
+[package]
+name = "dnpfs-fuse"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dnpfs-core = { path = "../dnpfs-core" }
+fuser = "0.14"
+clap = { version = "4.5", features = ["derive"] }
+libc = "0.2"
+thiserror = "1.0"
+uuid = { version = "1.8", features = ["v4"] }
+bytemuck = "1.15"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }

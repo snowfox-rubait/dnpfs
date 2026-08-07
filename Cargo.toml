@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "crates/dnpfs-core",
+    "crates/dnpfs-format",
+    "crates/dnpfs-fuse",
+    "crates/dnpfs-tools",
+]
+resolver = "2"

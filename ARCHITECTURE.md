@@ -90,6 +90,9 @@ For practical purposes DNPFS has no meaningful storage limit. 16 exabytes exceed
 
 FAT32 uses 32-bit fields for file size — a design decision made in the 1980s when files larger than a few MB were inconceivable. The 4GB per-file limit is a direct consequence of a 32-bit size field (2^32 bytes = 4GB). DNPFS uses 64-bit fields throughout, designed with no artificial ceiling.
 
+**Metadata Device Sizing and Capacity Guidelines:**
+The 16 GB SSD sizing used throughout this document is an illustrative example of a typical minimum metadata-to-data capacity ratio ($1.0\%$ to $1.5\%$). DNPFS natively supports metadata SSDs of any size (e.g. 120 GB, 500 GB, 2 TB+). Over-provisioning the metadata SSD is explicitly recommended as a zero-cost design mitigation against metadata space exhaustion (`ENOSPC`).
+
 **Filename and path length** are explicitly fixed to standard Linux POSIX limits: **255 bytes** per filename component (`NAME_MAX`, matching ext4/btrfs) and **4096 bytes** for total path length (`PATH_MAX`). These values define the fixed buffer allocations in directory entries and inode structures for format v1.
 
 ---
@@ -254,14 +257,27 @@ To prevent overflow in pathologically fragmented files, indirect blocks are chai
 
 ---
 
-### Block Checksum Table Entry
+### Block Checksum Table & Segmented Layout
 
-The checksum table is stored as a flat array on the metadata SSD, indexed directly by the data device's block number. This eliminates the need to store individual block offsets in each entry.
+To support online volume resizing and avoid contiguous physical SSD layout allocation blockages, the checksum table is not stored as a single monolithic flat array. Instead, it is organized into a **Segmented Checksum Table** layout:
 
+1. **Segmented Checksum Blocks:**
+   - The Checksum Table is divided into **1 MB Checksum Segments** allocated dynamically on the metadata SSD.
+   - Each 1 MB segment holds 43,690 `BlockChecksumEntry` records (24 bytes each), covering a **~170.6 MB span** of contiguous 4KB data blocks.
+   - Looking up an entry for block $B$ remains a constant-time $O(1)$ calculation:
+     $$\text{Segment Index} = \left\lfloor \frac{B}{\text{BLOCKS\_PER\_SEGMENT}} \right\rfloor$$
+     $$\text{Offset in Segment} = (B \pmod{\text{BLOCKS\_PER\_SEGMENT}}) \times 24\text{ bytes}$$
+
+2. **Master Checksum Index Table (Chained Growth):**
+   - Segment pointers are tracked in the **Master Checksum Index Table**.
+   - To prevent the index table itself from becoming a contiguous growth bottleneck, it is structured as a **Chained Metadata Block List** (a linked list of 4KB index blocks). Each 4KB block holds up to 510 segment pointers (8 bytes each) and a `next_index_block` pointer to the next block. New index blocks are allocated dynamically from the metadata free pool as capacity grows.
+
+**Block Checksum Table Entry Struct (24 bytes):**
 ```
 checksum:           u64   — 64-bit xxHash3 or CRC32C checksum (8 bytes)
 last_verified:      timestamp (8 bytes)
 status:             enum { good, suspect, bad, remapped } (4 bytes packed/padded)
+reserved:           u32 (4 bytes alignment padding)
 ```
 
 ### Bad Block Map Entry
@@ -283,6 +299,21 @@ created:            timestamp
 operation_type:     enum { write, delete, copy, rename }
 status:             enum { pending, committed, rolled_back, aborted }
 ```
+
+### Free Block Allocation Bitmap & Segmented Layout
+
+To avoid contiguous growth blockages on the metadata SSD when resizing the volume, the free block allocation bitmap is organized as a segmented structure:
+
+1. **Segmented Bitmap Blocks:**
+   - The bitmap is divided into **4KB Bitmap Blocks** allocated dynamically on the metadata SSD.
+   - Each 4KB bitmap block contains 32,768 bits, with each bit representing the allocation status of a single 4KB data block on the data device. One 4KB bitmap block covers **128 MB** of contiguous data storage.
+   - Querying or toggling the status of block $B$ is a constant-time $O(1)$ lookup:
+     $$\text{Bitmap Block Index} = \left\lfloor \frac{B}{32768} \right\rfloor$$
+     $$\text{Bit Position} = B \pmod{32768}$$
+
+2. **Master Bitmap Index Table (Chained Growth):**
+   - The locations of all active 4KB bitmap blocks are tracked in the **Master Bitmap Index Table**.
+   - The index table is organized as a **Chained Metadata Block List** (a linked list of 4KB index blocks). Each 4KB block holds up to 510 bitmap block pointers (8 bytes each) and a `next_index_block` pointer to the next block. New index blocks are allocated dynamically as the data capacity expands.
 
 ---
 
@@ -693,9 +724,10 @@ Runs as a background service. Handles:
 - `dnpfs-format` — formats both devices as a paired DNPFS volume
 - `dnpfs-check` — filesystem check tool, understands two-device layout
 - `dnpfs-recover` — forensic recovery tool, imports allocation.dry for partial write analysis
-- `dnpfs-backup` — manual meta device backup and restore
+- `dnpfs-backup` — manual meta device backup and restore (supports `--expand` to fit larger metadata devices)
 - `dnpfs-smart` — S.M.A.R.T. status report for both devices
 - `dnpfs-dry` — inspect, confirm, or forcefully abort pending dry run manifests (via DNPFS_IOC_ABORT_TRANSACTION)
+- `dnpfs-resize` — resizes the filesystem to fit expanded partitions, updating metadata and relocating the backup signature header on data device online or offline
 
 ---
 
@@ -843,6 +875,14 @@ DNPFS tracks drive health via two complementary metrics operating at different l
 
 **Reconciliation Policy:** The system treats both metrics as independent triggers on a unified health ladder: reaching *either* hardware critical thresholds (S.M.A.R.T. >100 remaps) OR filesystem safety bounds (5,000 logical bad blocks) immediately escalates volume posture to `CRITICAL_DEGRADATION`, triggering automatic metadata backups and issuing persistent administrator warnings.
 
+### Metadata Capacity Utilization Monitoring
+
+In addition to physical drive health, the background daemon `dnpfsd` monitors metadata capacity utilization (used inodes and allocated metadata blocks relative to limits). To prevent unexpected write rejections (`ENOSPC`), `dnpfsd` implements a **Capacity Utilization Escalation Ladder**:
+
+- **Warning Threshold (80% utilization):** Issues a system warning advising the administrator of high metadata space utilization.
+- **Critical Threshold (90% utilization):** Recommends metadata device expansion (`dnpfs-resize`) or file/inode pruning.
+- **Emergency Protection (95% utilization):** Triggers an immediate, automatic metadata backup to local and configured remote endpoints to protect volume structural state.
+
 ---
 
 ## Metadata Backup System
@@ -874,9 +914,10 @@ The image is a complete sector-for-sector copy of the meta device, compressed an
 ### Restore Procedure
 
 ```
-dnpfs-backup --restore backup.img --target /dev/sdX
+dnpfs-backup --restore backup.img --target /dev/sdX [--expand]
 → Verify backup checksum
 → Write image to new meta device
+→ If --expand is passed: dynamically expand the free metadata bitmaps and tables to fit the target block device capacity
 → Update UUID pairing if device UUID changed
 → Run dnpfs-check to verify consistency with data device
 ```
@@ -1107,7 +1148,12 @@ dnpfs-import --backup meta-backup.img --data-device /dev/sdX
 
 These are real constraints users should understand before adopting DNPFS. They are accepted tradeoffs, not bugs.
 
-**Not portable natively.** DNPFS requires a custom driver or userspace FUSE runner on hosts that mount the volume. To solve this, DNPFS volumes formatted with the optional **Self-Contained Plug-and-Play Bootstrap Partition (`DNPFS_BOOTSTRAP`)** embed a 512MB FAT32 partition containing standalone `dnpfs-fuse` AppImage binaries (x86_64 and AArch64 Linux), DKMS driver packages, and mount scripts. This allows any computer to immediately mount the volume without downloading external software.
+**Not portable natively.** DNPFS requires a custom driver or userspace FUSE runner on hosts that mount the volume. To solve this, DNPFS volumes formatted with the optional **Self-Contained Plug-and-Play Bootstrap Partition (`DNPFS_BOOTSTRAP`)** embed a 512MB FAT32 partition containing standalone `dnpfs-fuse` AppImage binaries (x86_64 and AArch64 Linux), mount scripts, and cross-platform wrappers for userspace FUSE frameworks (such as WinFsp on Windows and macFUSE on macOS). 
+
+To prevent driver version staleness and supply-chain update hijacking (substitution attacks), the partition enforces **Verification-Before-Promotion (A/B Layout)**:
+- A write-protected primary slot holds the factory binary and a pinned **Root Public Key**.
+- Updates are written to a secondary slot and validated using a **Key Rotation Certificate Chain** signed by the offline Master Root private key. The update is only promoted to active after verifying signature validity back to the pinned Root Public Key. Write-back of updates is strictly gated by administrator opt-in prompts.
+- Windows/macOS mounting requires installing their respective FUSE libraries first if not present, and FUSE runs with a performance ceiling (not suited for production context crossing, which defaults to the `dnpfs.ko` kernel module).
 
 **Not bootable.** By design. DNPFS is a storage filesystem. The OS cannot boot from it because the kernel module is not loaded at boot time. This is a conscious tradeoff accepted at the design stage.
 
@@ -1142,7 +1188,7 @@ Even with FUA, some drive firmware reports confirmation before physical write is
 
 ## Future Work
 
-- **Self-Contained Plug-and-Play Bootstrap Partition (`DNPFS_BOOTSTRAP`)** — optional 512 MB FAT32 metadata partition embedding offline Linux DKMS drivers, statically compiled `dnpfs-fuse` AppImage binaries (x86_64/AArch64), and setup scripts to enable zero-download mounting across arbitrary hosts.
+- **Self-Contained Plug-and-Play Bootstrap Partition (`DNPFS_BOOTSTRAP`)** — optional 512 MB FAT32 metadata partition embedding offline Linux DKMS drivers, statically compiled `dnpfs-fuse` AppImage binaries, and cross-platform wrappers. Auto-updates are cryptographically verified against a pinned Root Public Key via A/B partition slots using a short-lived key rotation certificate chain to protect against supply-chain substitution exploits.
 - **Git-based metadata backup** — serialize metadata state as structured text (YAML/CBOR) and commit to a self-hosted git repository (Gitea/Forgejo) on every backup trigger. Provides full version history, delta compression, diff visibility between states, and push to any remote. Planned as a separate subsystem with native support in `dnpfsd`.
 - **Inline small file storage** — files below a configurable size threshold (suggested: 4KB) stored entirely on the meta device, eliminating the data device round-trip and block-level checksum overhead for small files
 - **Parity blocks for meta device** — store XOR parity of metadata regions to enable single-sector reconstruction without a full backup restore

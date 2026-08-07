@@ -1,0 +1,14 @@
+[package]
+name = "dnpfs-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+uuid = { version = "1.8", features = ["v4", "serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+thiserror = "1.0"
+bytemuck = { version = "1.15", features = ["derive"] }
+libc = "0.2"

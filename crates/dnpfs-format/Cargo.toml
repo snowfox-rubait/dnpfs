@@ -1,0 +1,11 @@
+[package]
+name = "dnpfs-format"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dnpfs-core = { path = "../dnpfs-core" }
+clap = { version = "4.5", features = ["derive"] }
+uuid = { version = "1.8", features = ["v4"] }
+bytemuck = "1.15"
+libc = "0.2"
