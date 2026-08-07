@@ -334,7 +334,7 @@ Block 400001 → xxhash3: 0xC71D44E89B01F2D3
 Block 400002 → xxhash3: 0x88EF01A9BC3D4E5F
 ```
 
-Individual checksums are consulted during writes (read-back verification), during recovery (manifest cross-check), and when a group checksum fails (see below).
+Individual checksums are consulted during writes (if optional read-back verification is enabled), during recovery (manifest cross-check), and when a group checksum fails (see below).
 
 ### Level 2 — Group Checksums
 
@@ -752,7 +752,7 @@ To reconcile transactional safety with wear mitigation, DNPFS separates log writ
 The detailed transactional sequence is:
 1. Write the transaction planning manifest to the WAL on the metadata device → issue FUA flush → wait for hardware confirmation.
 2. Only after metadata WAL confirms → write the data blocks sequentially to the data device.
-3. Read back written data blocks from the data device → verify checksums (optional/configurable; see below).
+3. Read back written data blocks from the data device and verify checksums (optional/configurable; disabled by default on spinning HDDs to preserve sequential write throughput, delegating integrity verification to background idle scrubbing).
 4. Write the confirmation marker to the metadata WAL → issue FUA flush → wait for confirmation.
 5. Inodes and block bitmaps are updated in RAM, and checkpointed to their permanent locations on the SSD asynchronously.
 
@@ -805,7 +805,7 @@ Before every transaction, the current state of affected inodes and directory ent
 
 Every data block written to the data device has a corresponding xxHash3/CRC32C checksum stored in the checksum table on the meta device. This enables detection of silent write failures — cases where the drive confirms a write but writes garbage.
 
-**On write:** checksum is computed before write, stored in manifest, verified by read-back after write, then stored permanently in the checksum table.
+**On write:** checksum is computed before write, stored in manifest, verified by read-back after write (if optional read-back verification is enabled; disabled by default on spinning HDDs), then stored permanently in the checksum table.
 
 **On read:** checksum is recomputed from the block content and compared to the stored checksum. A mismatch triggers bad sector handling.
 
@@ -815,7 +815,7 @@ DNPFS strictly distinguishes between **Write-Time Faults** (recoverable via acti
 
 **Branch 1 — Write-Time Fault (Verification Mismatch during Write):**
 ```
-Checksum mismatch detected during Phase 4 read-back verify:
+Checksum mismatch detected during Phase 4 read-back verify (if enabled):
   → Source buffer is still present in RAM
   → Add sector/block X to bad_block_map on metadata device (status=bad)
   → Allocate clean alternative block Y (not in bad_block_map, not reserved)
@@ -1062,8 +1062,8 @@ Multiple processes may attempt operations simultaneously. DNPFS handles this wit
 - **Multiple Allocation Manifests:** Rather than a single global file, each active transaction utilizes a dedicated `allocation_<write_id>.dry` manifest. This reduces write contention and allows independent operations to proceed concurrently.
 - Two operations may not hold overlapping block reservations.
 - Reservations are granted in order of request.
-- **Strict Ascending Extent Locking Invariant (Deadlock Elimination):** To prevent AB-BA circular wait deadlocks in kernel space when concurrent operations request multi-extent block reservations, all transactions **must sort their requested block extents by strictly ascending starting sector address** prior to submitting reservation requests to the kernel coordinator.
-- **Starvation Prevention & Priority Aging:** To prevent long-running reservations from starving smaller overlapping write requests indefinitely, the reservation coordinator implements **Priority Aging**. Reservation waiters accumulate priority based on wait duration ($\text{priority} = \text{wait\_time\_ms} \times \text{weight}$). If a waiter's target block range overlaps a long-held reservation and waits longer than 5,000 ms, the coordinator elevates its priority to `RANGE_PRIORITY_INHERITANCE`, pausing new allocation requests **strictly for transactions whose requested block range overlaps the contended span**. Unrelated non-overlapping transactions across the volume continue to allocate and execute in parallel without any global system stall.
+- **Lock Ordering by Block Address (Deadlock Prevention):** To prevent AB-BA circular wait deadlocks in kernel space when concurrent operations request multi-extent block reservations, all transactions **must sort their requested block extents by strictly ascending starting sector address** prior to submitting reservation requests to the kernel coordinator.
+- **Starvation Prevention via Priority Inheritance:** To prevent long-running reservations from starving smaller overlapping write requests indefinitely, the reservation coordinator implements a priority inheritance protocol based on wait duration. If a waiter's target block range overlaps a long-held reservation and waits longer than 5,000 ms, the coordinator temporarily propagates priority levels to the blocking transaction and pauses new allocation requests **strictly for transactions whose requested block range overlaps the contended span**. Unrelated non-overlapping transactions across the volume continue to allocate and execute in parallel without any global system stall.
 - A new dry run that would require blocks already reserved must wait or fail with a retry signal.
 - Directory entry locks are held for the duration of any operation that modifies directory structure.
 - Read operations do not require reservations but do check the TRIM suppression list:
@@ -1182,7 +1182,7 @@ DNPFS resolves this by defining strict write-ordering boundaries using WAL trans
 
 ### Drive Firmware Lies
 
-Even with FUA, some drive firmware reports confirmation before physical write is complete. DNPFS mitigates this with read-back checksum verification but cannot fully compensate for drives that lie about FUA compliance. Use of drives with verified FUA support is recommended.
+Even with FUA, some drive firmware reports confirmation before physical write is complete. DNPFS mitigates this with read-back checksum verification (if enabled) but cannot fully compensate for drives that lie about FUA compliance. Use of drives with verified FUA support is recommended.
 
 ---
 
@@ -1212,7 +1212,7 @@ DNPFS builds upon several established structural paradigms and caching drivers i
 
 ## Contributing
 
-DNPFS is open source and dual-licensed under **GPL-2.0-only** and **MIT**. Contributions, design feedback, and alternative solutions to the problems described here are welcome. If you have encountered a similar architecture and have real-world failure data, please open an issue — especially for the cache coherency and FUA compliance sections.
+DNPFS is open source. To prevent legal and linker symbol compatibility conflicts with the Linux kernel subsystem, the kernel module (`dnpfs.ko`) is licensed strictly under **GPL-2.0-only**. All userspace prototype binaries, formatting utilities, and CLI tools (`dnpfs-fuse`, `dnpfs-format`, and `dnpfs-tools`) are dual-licensed under **GPL-2.0-only** and **MIT**. Contributions, design feedback, and alternative solutions to the problems described here are welcome. If you have encountered a similar architecture and have real-world failure data, please open an issue — especially for the cache coherency and FUA compliance sections.
 
 The design is more important than the code at this stage. If you see a flaw in the architecture, that is the most valuable thing to report.
 
